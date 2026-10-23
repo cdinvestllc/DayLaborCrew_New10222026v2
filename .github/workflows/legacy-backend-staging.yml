@@ -38,6 +38,7 @@ jobs:
       JWT_EXPIRE_HOURS: "24"
       CORS_ORIGINS: ${{ vars.STAGING_WEB_ORIGIN }}
       TRUSTED_PROXY_HOPS: "1"
+      EMERGENT_LLM_KEY: staging-only-placeholder-not-used-by-tests
       STAGING_STRIPE_MODE: ${{ vars.STAGING_STRIPE_MODE }}
       STAGING_STRIPE_API_KEY: ${{ secrets.STAGING_STRIPE_API_KEY }}
       STAGING_STRIPE_WEBHOOK_SECRET: ${{ secrets.STAGING_STRIPE_WEBHOOK_SECRET }}
