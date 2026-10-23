@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, Header
 from database import db
 from auth import get_current_user, user_to_response
 from models import JobCreate, JobUpdate, RatingCreate, ClockInRequest, DisputeCreate, DisputeMessageCreate, DisputeAppealCreate
@@ -58,57 +58,102 @@ router = APIRouter()
 
 
 @router.post("/", status_code=201)
-async def create_job(data: JobCreate, current_user: dict = Depends(get_current_user)):
+async def create_job(
+    data: JobCreate,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: dict = Depends(get_current_user)
+):
     if current_user["role"] != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can post jobs")
-    from routes.payment_routes import consume_job_post_credit
-    await consume_job_post_credit(current_user)
 
+    # Validate input/address/images before reserving legacy credits or tokens.
     coords = valid_coords(data.lat, data.lng)
     if coords:
         location = {"address": data.address, "lat": coords[0], "lng": coords[1], "city": data.city or "", "state": data.state or ""}
     else:
         location = await geocode_address(data.address)
     if not location:
-        from routes.payment_routes import refund_job_post_credit
-        await refund_job_post_credit(current_user)
         raise HTTPException(status_code=400, detail="We couldn't locate that address. Please pick a suggested address.")
     images = _validated_job_images(data.images, current_user["id"])
+    from token_actions import active_catalog, execute_token_action, record_qualifying_activity, uses_token_billing
+    from token_billing import utc_iso
+    token_mode = uses_token_billing(current_user)
+    is_emergency = bool(data.is_emergency)
+    job_id = str(uuid.uuid4())
 
+    if token_mode:
+        _, catalog = await active_catalog()
+        cost = int(catalog.token_costs.contractor_post_job)
+        if is_emergency:
+            cost += int(catalog.token_costs.emergency_job_surcharge)
+        action_key = (idempotency_key or f"jobpost:{job_id}").strip()
+        job_doc = {
+            "id": job_id, "contractor_id": current_user["id"],
+            "contractor_name": current_user.get("company_name") or current_user["name"],
+            "contractor_photo": current_user.get("logo") or current_user.get("profile_photo"),
+            "title": data.title, "description": data.description, "trade": data.trade,
+            "crew_needed": data.crew_needed, "crew_accepted": [],
+            "start_time": data.start_time, "end_time": data.end_time, "pay_rate": data.pay_rate,
+            "location": location, "status": "open", "is_emergency": is_emergency,
+            "emergency_paid": is_emergency, "created_at": now_str(), "completed_at": None,
+            "rated_crew": [], "rated_by_crew": [], "invited_crew": [], "images": images,
+            "billing_source": "tokens", "token_cost": cost
+        }
+
+        async def persist_job(reservation_id: str):
+            doc = {**job_doc, "token_reservation_id": reservation_id}
+            await db.jobs.insert_one(doc)
+            doc.pop("_id", None)
+            await publish_job(doc)
+            return doc
+
+        result = await execute_token_action(
+            current_user, amount=cost, idempotency_key=action_key,
+            reason="Post emergency job" if is_emergency else "Post contractor job",
+            action=persist_job, reference_id=job_id,
+            metadata={"action_type": "job_posting", "job_id": job_id, "emergency": is_emergency}
+        )
+        saved = result.get("result")
+        if not saved:
+            saved = await db.jobs.find_one({"token_reservation_id": result.get("reservation_id")}, {"_id": 0})
+        if not saved:
+            saved = await db.jobs.find_one({"id": job_id}, {"_id": 0})
+        await record_qualifying_activity(
+            current_user["id"], "job_posting", f"jobpost:{job_id}",
+            metadata={"job_id": job_id, "emergency": is_emergency}
+        )
+        if not saved:
+            raise HTTPException(status_code=503, detail="Job was saved but is still being reconciled; refresh your jobs shortly.")
+        return {**saved, "tokens_charged": cost, "token_balance": result["balance"],
+                "already_processed": result["already_processed"]}
+
+    # Legacy-paid accounts remain on the existing credit system until their paid-through
+    # date. This avoids charging legacy subscribers tokens for a feature they already bought.
+    from routes.payment_routes import consume_job_post_credit, refund_job_post_credit
+    await consume_job_post_credit(current_user)
     job_doc = {
-        "id": str(uuid.uuid4()),
-        "contractor_id": current_user["id"],
+        "id": job_id, "contractor_id": current_user["id"],
         "contractor_name": current_user.get("company_name") or current_user["name"],
         "contractor_photo": current_user.get("logo") or current_user.get("profile_photo"),
-        "title": data.title,
-        "description": data.description,
-        "trade": data.trade,
-        "crew_needed": data.crew_needed,
-        "crew_accepted": [],
-        "start_time": data.start_time,
-        "end_time": data.end_time,
-        "pay_rate": data.pay_rate,
-        "location": location,
-        # Emergency jobs stay hidden from crew until the one-time emergency fee is paid
-        "status": "pending_payment" if data.is_emergency else "open",
-        "is_emergency": bool(data.is_emergency),
-        "emergency_paid": False,
-        "created_at": now_str(),
-        "completed_at": None,
-        "rated_crew": [],
-        "rated_by_crew": [],
-        "invited_crew": [],
-        "images": images,
+        "title": data.title, "description": data.description, "trade": data.trade,
+        "crew_needed": data.crew_needed, "crew_accepted": [],
+        "start_time": data.start_time, "end_time": data.end_time, "pay_rate": data.pay_rate,
+        "location": location, "status": "pending_payment" if is_emergency else "open",
+        "is_emergency": is_emergency, "emergency_paid": False, "created_at": now_str(),
+        "completed_at": None, "rated_crew": [], "rated_by_crew": [], "invited_crew": [], "images": images
     }
-
-    await db.jobs.insert_one(job_doc)
+    try:
+        await db.jobs.insert_one(job_doc)
+    except Exception:
+        await refund_job_post_credit(current_user)
+        raise
     job_doc.pop("_id", None)
-
     if job_doc["status"] == "pending_payment":
         from routes.payment_routes import get_emergency_price
         return {**job_doc, "requires_payment": True, "emergency_fee": await get_emergency_price()}
-
     await publish_job(job_doc)
+    await record_qualifying_activity(current_user["id"], "job_posting", f"jobpost:{job_id}",
+                                     metadata={"job_id": job_id, "emergency": False})
     return job_doc
 
 
