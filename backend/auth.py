@@ -226,4 +226,4 @@ def require_role(*roles):
 
 
 def user_to_response(user: dict) -> dict:
-    return {k: v for k, v in user.items() if k not in ("password_hash", "_id", "token_version")}
+    return {k: v for k, v in user.items() if k not in ("password_hash", "_id", "token_version") and not k.startswith("_token_")}
