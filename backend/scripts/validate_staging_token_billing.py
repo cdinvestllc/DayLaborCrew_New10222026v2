@@ -80,6 +80,62 @@ async def verify_mongo_transactions(mongo_uri: str, db_name: str) -> None:
         client.close()
 
 
+async def verify_api_uses_staging_database(api_url: str, mongo_uri: str, db_name: str) -> None:
+    """Verify the remote API authenticates against the same seeded staging user in this DB."""
+    email = require("STAGING_SUPERADMIN_EMAIL").lower()
+    password = require("STAGING_SUPERADMIN_PASSWORD")
+    client = AsyncIOMotorClient(
+        mongo_uri, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000
+    )
+    try:
+        staged_user = await client[db_name].users.find_one(
+            {"email": email}, {"_id": 0, "id": 1, "role": 1}
+        )
+    except Exception as exc:
+        client.close()
+        raise RuntimeError(
+            f"Could not read the seeded super-admin from the isolated staging DB ({type(exc).__name__})"
+        ) from None
+    finally:
+        client.close()
+    if not staged_user or not staged_user.get("id"):
+        raise RuntimeError("The configured super-admin was not found in the isolated staging database")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        login_response = await client.post(
+            f"{api_url.rstrip('/')}/api/auth/login",
+            json={"email": email, "password": password},
+        )
+        if login_response.status_code != 200:
+            raise RuntimeError(
+                "Staging API login failed for the configured super-admin "
+                f"(HTTP {login_response.status_code}); check seeded account and API/database settings"
+            )
+        try:
+            session = login_response.json()
+            token = session["access_token"]
+            api_user = session["user"]
+        except (ValueError, KeyError, TypeError):
+            raise RuntimeError("Staging API login response was missing the expected session fields") from None
+        if api_user.get("id") != staged_user["id"]:
+            raise RuntimeError(
+                "Staging API authenticated a different super-admin record than the isolated MongoDB target; "
+                "verify the staging API database configuration"
+            )
+        wallet_response = await client.get(
+            f"{api_url.rstrip('/')}/api/billing/wallet",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if wallet_response.status_code != 200:
+            raise RuntimeError(
+                "Staging API token-wallet probe failed "
+                f"(HTTP {wallet_response.status_code}); check API transaction support and staging database wiring"
+            )
+        wallet = wallet_response.json()
+        if not isinstance(wallet.get("balance"), int) or not isinstance(wallet.get("lots"), list):
+            raise RuntimeError("Staging API token-wallet probe returned an unexpected response")
+
+
 async def verify_stripe(api_url: str) -> None:
     key = require("STAGING_STRIPE_API_KEY")
     secret = require("STAGING_STRIPE_WEBHOOK_SECRET")
@@ -178,7 +234,9 @@ async def main() -> None:
     api_host, web_host, db_name = validate_staging_configuration()
     mongo_uri = require("STAGING_MONGO_URL")
     await verify_mongo_transactions(mongo_uri, db_name)
-    print(f"PASS: isolated MongoDB replica-set transaction smoke test ({db_name})")
+    print(f"PASS: isolated MongoDB replica-set transaction rollback check ({db_name})")
+    await verify_api_uses_staging_database(os.environ["STAGING_API_URL"], mongo_uri, db_name)
+    print("PASS: staging API authenticates against the same seeded MongoDB super-admin and token wallet")
     await verify_stripe(os.environ["STAGING_API_URL"])
     print("PASS: Stripe test credentials, enabled webhook endpoint, and required event subscriptions")
     await verify_paypal(os.environ["STAGING_API_URL"])
