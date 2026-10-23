@@ -327,12 +327,14 @@ async def _grant_subscription_period(
         idempotency_key=idempotency_key,
         reason=f"{sub['plan_id']} token allowance for {period_label}",
         source="subscription_grant", expires_at=expires_at,
+        # Metadata/references are deliberately stable across invoice webhooks and the
+        # annual-release scheduler. The same subscription/month must be byte-for-byte
+        # idempotent regardless of which delivery path wins the race.
         metadata={
-            "provider": sub["provider"], "provider_subscription_id": sub.get("provider_subscription_id"),
-            "billing_subscription_id": sub["id"], "billing_period": period_label,
-            "provider_reference": provider_reference, "catalog_version": sub["catalog_version"]
+            "provider": sub["provider"], "billing_subscription_id": sub["id"],
+            "billing_period": period_label, "catalog_version": sub["catalog_version"]
         },
-        reference_id=provider_reference
+        reference_id=sub.get("provider_subscription_id") or sub["id"]
     )
     next_grant_at = None
     next_grant_index = None
@@ -888,9 +890,9 @@ async def release_due_annual_subscription_grants(
             reason=f"{sub['plan_id']} token allowance for {_period_label(expected_period_start)}",
             source="subscription_grant", expires_at=expiry,
             metadata={"provider": sub["provider"], "billing_subscription_id": sub["id"],
-                      "billing_period": _period_label(expected_period_start), "scheduled": True,
+                      "billing_period": _period_label(expected_period_start),
                       "catalog_version": sub["catalog_version"]},
-            reference_id=sub.get("provider_subscription_id")
+            reference_id=sub.get("provider_subscription_id") or sub["id"]
         )
         next_index = int(sub.get("next_grant_index", 1)) + 1
         next_at = _add_months_anchored(anchor, next_index)
