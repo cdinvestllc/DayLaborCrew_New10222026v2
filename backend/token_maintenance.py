@@ -427,6 +427,75 @@ async def _record_verified_referral_activities(limit: int) -> int:
     return recorded
 
 
+async def _backfill_job_activities(limit: int) -> dict[str, int]:
+    """Recover qualifying activity events from durable token-paid job actions."""
+    cursor = db.jobs.find(
+        {"$or": [
+            {"billing_source": "tokens"},
+            {"crew_acceptance_receipts.0": {"$exists": True}}
+        ]},
+        {"_id": 0, "id": 1, "contractor_id": 1, "billing_source": 1,
+         "crew_acceptance_receipts": 1}
+    ).limit(max(1, min(limit, 1000)))
+    jobs = await cursor.to_list(length=max(1, min(limit, 1000)))
+    posted = applications = 0
+    for job in jobs:
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        if job.get("billing_source") == "tokens" and job.get("contractor_id"):
+            if await record_qualifying_activity(
+                job["contractor_id"], "job_posting", f"jobpost:{job_id}",
+                metadata={"job_id": job_id, "backfilled": True}
+            ):
+                posted += 1
+        seen = set()
+        for receipt in job.get("crew_acceptance_receipts") or []:
+            crew_id = receipt.get("crew_id")
+            reservation_id = receipt.get("reservation_id")
+            if not crew_id or not reservation_id or crew_id in seen:
+                continue
+            seen.add(crew_id)
+            if await record_qualifying_activity(
+                crew_id, "job_application", f"apply:{job_id}:{crew_id}",
+                metadata={"job_id": job_id, "backfilled": True}
+            ):
+                applications += 1
+    return {"job_posting_events_backfilled": posted, "job_application_events_backfilled": applications}
+
+
+async def _backfill_profile_activity(limit: int) -> int:
+    """Retry profile activity outbox markers left by a transient activity-ledger error."""
+    cursor = db.users.find(
+        {"_token_profile_activity_pending": {"$exists": True}},
+        {"_id": 0, "id": 1, "_token_profile_activity_pending": 1}
+    ).limit(max(1, min(limit, 1000)))
+    rows = await cursor.to_list(length=max(1, min(limit, 1000)))
+    completed = 0
+    for user in rows:
+        uid = user.get("id")
+        pending = user.get("_token_profile_activity_pending") or {}
+        period_index = pending.get("period_index")
+        if not uid or period_index is None:
+            continue
+        event_id = f"profileupdate:{uid}:{int(period_index)}"
+        metadata = {"changed_fields": pending.get("changed_fields") or [],
+                    "period_index": int(period_index), "backfilled": True}
+        inserted = await record_qualifying_activity(
+            uid, "meaningful_profile_update", event_id, metadata=metadata
+        )
+        already_exists = await db.token_activity_events.find_one(
+            {"user_id": uid, "event_id": event_id}, {"_id": 1}
+        )
+        if inserted or already_exists:
+            await db.users.update_one(
+                {"id": uid, "_token_profile_activity_pending.period_index": int(period_index)},
+                {"$unset": {"_token_profile_activity_pending": ""}}
+            )
+            completed += 1
+    return completed
+
+
 async def _business_action_succeeded(reservation: dict) -> bool:
     reservation_id = reservation.get("reservation_id")
     user_id = reservation.get("user_id")
@@ -499,6 +568,8 @@ async def run_token_maintenance(limit: int = 250) -> dict[str, Any]:
     results["paid_subscriptions_downgraded"] = await _downgrade_expired_paid_subscriptions(bounded)
     results["expired_portfolio_videos_removed"] = await _expire_portfolio_videos(bounded)
     results["referral_activities_recorded"] = await _record_verified_referral_activities(bounded)
+    results["job_activities_backfilled"] = await _backfill_job_activities(bounded)
+    results["profile_activities_backfilled"] = await _backfill_profile_activity(bounded)
     results["free_grants"] = await _issue_qualified_free_grants(bounded)
     results["reservation_reconciliation"] = await _reconcile_reservations(min(bounded, 500))
     # Expirations are applied on wallet operations; this pass also catches dormant wallets.
