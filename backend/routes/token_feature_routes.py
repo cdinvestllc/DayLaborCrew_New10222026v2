@@ -104,7 +104,7 @@ async def token_boost_job(
     except (TypeError, ValueError):
         expiry_dt = None
     if job.get("is_featured") and expiry_dt and expiry_dt > utc_now():
-        return {"status": "already_featured", "boost_expires_at": expiry, "balance": (await wallet.wallet_summary(current_user["id"]))["balance"]}
+        return {"status": "already_featured", "boost_expires_at": expiry, "tokens_charged": 0, "already_processed": True, "balance": (await wallet.wallet_summary(current_user["id"]))["balance"]}
     cost = int(catalog.token_costs.contractor_job_boost)
     key = _request_key(idempotency_key, f"jobboost:{job_id}:{expiry or 'initial'}")
 
@@ -153,8 +153,8 @@ async def token_boost_profile(
     except (TypeError, ValueError):
         old_dt = None
     if old_dt and old_dt > utc_now():
-        return {"status": "already_featured", "profile_boost_expires_at": expiry,
-                "balance": (await wallet.wallet_summary(current_user["id"]))["balance"]}
+        return {"status": "already_featured", "profile_boost_expires_at": expiry, "tokens_charged": 0,
+                "already_processed": True, "balance": (await wallet.wallet_summary(current_user["id"]))["balance"]}
     cost = int(catalog.token_costs.crew_profile_boost)
     key = _request_key(idempotency_key, f"profileboost:{current_user['id']}:{expiry or 'initial'}")
 
