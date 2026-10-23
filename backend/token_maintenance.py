@@ -229,7 +229,7 @@ async def _ensure_starter_and_trial_grants(limit: int) -> dict[str, int]:
         {"_id": 0, "id": 1, "role": 1, "created_at": 1,
          "token_trial_started_at": 1, "token_trial_end_at": 1,
          "token_welcome_expiry_at": 1, "token_welcome_granted_at": 1,
-         "token_trial_granted_at": 1}
+         "token_trial_granted_at": 1, "is_verified": 1}
     ).limit(max(1, min(limit, 1000)))
     users = await cursor.to_list(length=max(1, min(limit, 1000)))
     welcome_grants = 0
@@ -250,7 +250,7 @@ async def _ensure_starter_and_trial_grants(limit: int) -> dict[str, int]:
                     {"id": uid, "token_welcome_expiry_at": {"$exists": False}},
                     {"$set": {"token_welcome_expiry_at": utc_iso(welcome_expiry)}}
                 )
-            if welcome_expiry and welcome_expiry > now and int(catalog.token_policy.welcome_tokens) > 0:
+            if user.get("is_verified") is True and welcome_expiry and welcome_expiry > now and int(catalog.token_policy.welcome_tokens) > 0:
                 result = await wallet.grant_tokens(
                     uid, int(catalog.token_policy.welcome_tokens),
                     idempotency_key=f"welcome:{uid}:token-v1",
@@ -366,7 +366,7 @@ async def _issue_qualified_free_grants(limit: int) -> dict[str, int]:
     free_tokens = int(catalog.plans["free_crew"].monthly_tokens)
     grant_days = int(catalog.token_policy.free_grant_expiry_days)
     cursor = db.users.find(
-        {"role": {"$in": ["crew", "contractor"]}, "billing_mode": "tokens_v1",
+        {"role": {"$in": ["crew", "contractor"]}, "billing_mode": "tokens_v1", "is_verified": True,
          "billing_subscription_status": {"$in": ["free", None]},
          "billing_plan": {"$in": ["free_crew", "free_contractor"]}},
         {"_id": 0, "id": 1, "role": 1, "created_at": 1, "token_free_period_start": 1,
