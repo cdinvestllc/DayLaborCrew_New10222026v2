@@ -5,12 +5,13 @@ import asyncio
 import json
 import os
 import shutil
+import secrets
 import subprocess
 import tempfile
 import uuid
 from datetime import timedelta
 from decimal import Decimal
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 
 from auth import get_current_user
@@ -63,6 +64,22 @@ def _verify_video_duration(data: bytes) -> float:
     if duration <= 0 or duration > VIDEO_DURATION_SECONDS:
         raise HTTPException(status_code=400, detail="Portfolio videos must be 30 seconds or shorter.")
     return duration
+
+
+@router.post("/maintenance/run")
+async def run_token_billing_maintenance(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    limit: int = Query(250, ge=1, le=1000)
+):
+    """Protected daily scheduler for migration, free grants, trials, and abandoned actions."""
+    configured = (os.environ.get("BILLING_SCHEDULER_SECRET") or "").strip()
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not configured:
+        raise HTTPException(status_code=503, detail="Billing maintenance scheduler is not configured.")
+    if not supplied or not secrets.compare_digest(supplied, configured):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+    from token_maintenance import run_token_maintenance
+    return await run_token_maintenance(limit)
 
 
 @router.post("/jobs/{job_id}/boost")
