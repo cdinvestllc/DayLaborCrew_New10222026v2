@@ -377,6 +377,7 @@ async def _grant_subscription_period(
     await db.users.update_one(
         {"id": sub["user_id"]},
         {"$set": {
+            "billing_mode": "tokens_v1", "token_plan": sub["plan_id"],
             "billing_plan": sub["plan_id"], "billing_subscription_id": sub["id"],
             "billing_subscription_status": "active", "billing_subscription_provider": sub["provider"],
             "billing_subscription_interval": sub.get("billing_interval"),
