@@ -238,6 +238,23 @@ async def list_jobs(
     if smart_match and current_user["role"] == "crew" and jobs:
         jobs = await generate_smart_job_matches(jobs, current_user)
 
+    # Active token-paid boosts outrank organic jobs in crew feeds. Expired boosts
+    # stop ranking immediately even if the cleanup worker has not run yet.
+    ranking_now = datetime.now(timezone.utc)
+    def _active_job_boost(job: dict) -> bool:
+        if not job.get("is_featured") or not job.get("boost_expires_at"):
+            return False
+        try:
+            expires = datetime.fromisoformat(str(job["boost_expires_at"]).replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            return expires > ranking_now
+        except (TypeError, ValueError):
+            return False
+    jobs.sort(key=lambda job: (
+        _active_job_boost(job),
+        str(job.get("created_at") or "")
+    ), reverse=True)
     return jobs
 
 
