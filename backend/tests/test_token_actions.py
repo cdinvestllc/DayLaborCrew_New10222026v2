@@ -270,7 +270,7 @@ def test_legacy_unused_job_credits_convert_at_most_once(monkeypatch):
     users.update_one.assert_awaited_once()
 
 
-def test_legacy_unused_credit_conversion_skips_expired_or_stale_period(monkeypatch):
+def test_legacy_unused_credit_conversion_grants_full_quota_if_counter_is_from_prior_period(monkeypatch):
     import token_maintenance
     cutover = datetime(2026, 10, 23, tzinfo=timezone.utc)
     subscription_end = datetime(2026, 10, 20, tzinfo=timezone.utc)
@@ -279,7 +279,7 @@ def test_legacy_unused_credit_conversion_skips_expired_or_stale_period(monkeypat
         token_policy=SimpleNamespace(free_paid_token_expiry_days=60)
     )
     monkeypatch.setattr(token_maintenance, "active_catalog", AsyncMock(return_value=(1, catalog)))
-    wallet = SimpleNamespace(grant_tokens=AsyncMock())
+    wallet = SimpleNamespace(grant_tokens=AsyncMock(return_value={"already_processed": False}))
     db = SimpleNamespace(token_ledger=SimpleNamespace(find_one=AsyncMock(return_value=None)),
                          users=SimpleNamespace(update_one=AsyncMock()))
     monkeypatch.setattr(token_maintenance, "wallet", wallet)
@@ -287,7 +287,7 @@ def test_legacy_unused_credit_conversion_skips_expired_or_stale_period(monkeypat
     user = {
         "id": "stale-period", "role": "contractor", "subscription_plan": "contractor_basic",
         "subscription_end": subscription_end.isoformat(), "job_post_period": "2026-01-01",
-        "job_posts_used": 0
+        "job_posts_used": 3
     }
-    assert run(token_maintenance._convert_unused_legacy_job_credits(user, cutover_at=cutover)) == 0
-    wallet.grant_tokens.assert_not_awaited()
+    assert run(token_maintenance._convert_unused_legacy_job_credits(user, cutover_at=cutover)) == 40
+    assert wallet.grant_tokens.await_args.kwargs["metadata"]["legacy_credits_converted"] == 4
