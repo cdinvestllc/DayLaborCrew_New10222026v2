@@ -67,7 +67,7 @@ Retries must reuse the same idempotency key and the same operation parameters. R
 ## Feature rollout, migration, and scheduled maintenance
 
 - Call POST /api/billing/features/maintenance/run daily with Authorization: Bearer BILLING_SCHEDULER_SECRET. The idempotent run processes starter/trial grants, trial downgrade, qualifying Free rewards, paid-through legacy cutover, reservation reconciliation, and expiry cleanup.
-- New signups start a 14-day Pro trial with temporary trial tokens and a one-time 10-token welcome grant. No automatic charge is initiated when the trial ends; the account downgrades to its role's Free tier.
+- New signups start a 14-day Pro trial with temporary trial tokens. The one-time 10-token welcome grant is issued only after the account is verified. No automatic charge is initiated when the trial ends; the account downgrades to its role's Free tier.
 - Free monthly grants require two qualifying events in the configured 30-day period: job posting, a verified/activated referral, job application, or a meaningful profile update. Event IDs are unique per user so duplicate delivery cannot increase the count.
 - Legacy paid accounts remain on legacy_compat until their paid-through date. Token checkout is blocked during that period. At cutover, unused credits from the final current Contractor job-post period are converted using the catalog job-post token cost, with an idempotent ledger key before billing mode changes.
 - Schedule both POST /api/billing/features/maintenance/run and POST /api/billing/payments/release-due-grants with BILLING_SCHEDULER_SECRET.
