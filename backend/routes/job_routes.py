@@ -321,53 +321,86 @@ async def delete_job(job_id: str, current_user: dict = Depends(get_current_user)
 async def accept_job(job_id: str, current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "crew":
         raise HTTPException(status_code=403, detail="Only crew members can accept jobs")
+    from token_actions import execute_token_action, record_qualifying_activity, uses_token_billing
 
-    from routes.payment_routes import require_active_subscription
-    require_active_subscription(current_user)
+    token_mode = uses_token_billing(current_user)
+    if not token_mode:
+        from routes.payment_routes import require_active_subscription
+        require_active_subscription(current_user)
+
     job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if current_user["id"] in job["crew_accepted"]:
+    if current_user["id"] in job.get("crew_accepted", []):
         raise HTTPException(status_code=400, detail="Already accepted this job")
-    if job["status"] != "open":
-        raise HTTPException(status_code=400, detail=f"Job is {job['status']}, cannot accept")
+    if job.get("status") != "open":
+        raise HTTPException(status_code=400, detail=f"Job is {job.get('status')}, cannot accept")
 
-    # Atomic: only succeeds while the job is open, not full, and the crew member isn't already on it
-    job = await db.jobs.find_one_and_update(
-        {"id": job_id, "status": "open", "crew_accepted": {"$ne": current_user["id"]},
-         "$expr": {"$lt": [{"$size": "$crew_accepted"}, "$crew_needed"]}},
-        {"$push": {"crew_accepted": current_user["id"]}, "$pull": {"invited_crew": current_user["id"]}},
-        return_document=True, projection={"_id": 0},
-    )
-    if not job:
-        raise HTTPException(status_code=409, detail="This job is no longer accepting crew")
-    new_crew = job["crew_accepted"]
-    new_status = "open"
-    if len(new_crew) >= job["crew_needed"]:
-        await db.jobs.update_one({"id": job_id, "status": "open"}, {"$set": {"status": "fulfilled"}})
-        new_status = "fulfilled"
+    async def perform_acceptance(reservation_id: str | None = None):
+        update = {"$push": {"crew_accepted": current_user["id"]},
+                  "$pull": {"invited_crew": current_user["id"]}}
+        if reservation_id:
+            update["$push"]["crew_acceptance_receipts"] = {
+                "crew_id": current_user["id"], "reservation_id": reservation_id, "accepted_at": now_str()
+            }
+        changed_job = await db.jobs.find_one_and_update(
+            {"id": job_id, "status": "open", "crew_accepted": {"$ne": current_user["id"]},
+             "$expr": {"$lt": [{"$size": "$crew_accepted"}, "$crew_needed"]}},
+            update, return_document=True, projection={"_id": 0},
+        )
+        if not changed_job:
+            raise HTTPException(status_code=409, detail="This job is no longer accepting crew")
+        new_crew = changed_job["crew_accepted"]
+        new_status = "open"
+        if len(new_crew) >= changed_job["crew_needed"]:
+            await db.jobs.update_one({"id": job_id, "status": "open"}, {"$set": {"status": "fulfilled"}})
+            new_status = "fulfilled"
+        return {"job": changed_job, "status": new_status}
+
+    if token_mode:
+        _, catalog = await __import__("token_actions").active_catalog()
+        cost = int(catalog.token_costs.crew_apply_job)
+        result = await execute_token_action(
+            current_user, amount=cost, idempotency_key=f"applyjob:{job_id}:{current_user['id']}",
+            reason="Apply to contractor job",
+            action=perform_acceptance, reference_id=job_id,
+            metadata={"action_type": "job_application", "job_id": job_id, "crew_id": current_user["id"]}
+        )
+        accepted = result.get("result")
+        if not accepted:
+            accepted_doc = await db.jobs.find_one({"id": job_id}, {"_id": 0, "crew_accepted": 1, "status": 1})
+            accepted = {"job": accepted_doc or {}, "status": (accepted_doc or {}).get("status", "open")}
+        await record_qualifying_activity(
+            current_user["id"], "job_application", f"apply:{job_id}:{current_user['id']}",
+            metadata={"job_id": job_id}
+        )
+        cost_charged = cost
+    else:
+        accepted = await perform_acceptance()
+        cost_charged = 0
 
     # Notify contractor via WebSocket
     try:
         from routes.ws_routes import manager
         await manager.send_to_user(job["contractor_id"], {
-            "type": "job_accepted",
-            "job_id": job_id,
-            "crew_name": current_user["name"],
-            "crew_count": len(new_crew),
-            "crew_needed": job["crew_needed"]
+            "type": "job_accepted", "job_id": job_id, "crew_name": current_user["name"],
+            "crew_count": len(accepted["job"].get("crew_accepted", [])), "crew_needed": job["crew_needed"]
         })
     except Exception:
         pass
 
-    # Send push notification to contractor
     try:
         from utils.push_utils import send_push_notification
-        await send_push_notification(db, job["contractor_id"], "job_accepted", job_title=job.get("title", ""), crew_name=current_user["name"])
+        await send_push_notification(db, job["contractor_id"], "job_accepted",
+                                     job_title=job.get("title", ""), crew_name=current_user["name"])
     except Exception:
         pass
 
-    return {"message": "Job accepted", "status": new_status}
+    response = {"message": "Job accepted", "status": accepted["status"]}
+    if token_mode:
+        response.update({"tokens_charged": cost_charged, "token_balance": result["balance"],
+                         "already_processed": result["already_processed"]})
+    return response
 
 
 @router.post("/{job_id}/start")
