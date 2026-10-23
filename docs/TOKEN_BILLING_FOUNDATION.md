@@ -9,7 +9,13 @@ This change adds a versioned billing catalog and spendable token wallet, and con
 - `GET /api/billing/catalog/history`: admin-only last 100 catalog versions.
 - `GET /api/billing/wallet`: authenticated user's token balance and active expiry lots.
 - `GET /api/billing/wallet/ledger?limit=50`: authenticated user's recent ledger entries.
-- `POST /api/billing/admin/wallets/{user_id}/grant`: admin-only token grant; requires a positive amount, reason, future timezone-aware expiry, and idempotency key.\n- `POST /api/billing/payments/stripe/subscription-session`: create Stripe monthly/annual Pro checkout for the signed-in user's role.\n- `POST /api/billing/payments/paypal/subscription`: create PayPal recurring subscription, after validating the configured PayPal plan against the catalog price and cadence.\n- `POST /api/billing/payments/stripe/token-pack-session` and `POST /api/billing/payments/paypal/token-pack-order`: create one-time token pack checkout.\n- `POST /api/billing/payments/paypal/token-pack-capture-payment/{payment_id}`: capture a signed-in user's returned PayPal token-pack order.\n- `GET /api/billing/payments/stripe/status/{session_id}` and `GET /api/billing/payments/paypal/subscription-status/{subscription_id}`: verified status/fulfillment checks.\n- `POST /api/billing/payments/release-due-grants`: protected scheduler endpoint for monthly allowance releases within annual subscriptions.
+- `POST /api/billing/admin/wallets/{user_id}/grant`: admin-only token grant; requires a positive amount, reason, future timezone-aware expiry, and idempotency key.
+- `POST /api/billing/payments/stripe/subscription-session`: create Stripe monthly/annual Pro checkout for the signed-in user's role.
+- `POST /api/billing/payments/paypal/subscription`: create PayPal recurring subscription, after validating the configured PayPal plan against the catalog price and cadence.
+- `POST /api/billing/payments/stripe/token-pack-session` and `POST /api/billing/payments/paypal/token-pack-order`: create one-time token pack checkout.
+- `POST /api/billing/payments/paypal/token-pack-capture-payment/{payment_id}`: capture a signed-in user's returned PayPal token-pack order.
+- `GET /api/billing/payments/stripe/status/{session_id}` and `GET /api/billing/payments/paypal/subscription-status/{subscription_id}`: verified status/fulfillment checks.
+- `POST /api/billing/payments/release-due-grants`: protected scheduler endpoint for monthly allowance releases within annual subscriptions.
 
 The wallet endpoints only operate on spendable `tokens`. The existing `points` field remains separate and is not converted or silently migrated.
 
@@ -36,7 +42,9 @@ Wallet state uses:
 - `token_wallets`: cached balance, keyed by user id.
 - `token_lots`: grants/purchases with remaining amount, source, and expiry.
 - `token_ledger`: append-only grants, spends, and expirations with unique per-user idempotency keys.
-- `billing_catalog`: active catalog and bounded version history.\n- `billing_payments`: idempotent token-pack/checkout records with provider reference, catalog price snapshot, and fulfillment state.\n- `billing_subscriptions`: provider subscription IDs, plan/price/token snapshots, renewal status, paid invoice/sale references, and annual monthly-release schedule.
+- `billing_catalog`: active catalog and bounded version history.
+- `billing_payments`: idempotent token-pack/checkout records with provider reference, catalog price snapshot, and fulfillment state.
+- `billing_subscriptions`: provider subscription IDs, plan/price/token snapshots, renewal status, paid invoice/sale references, and annual monthly-release schedule.
 
 Spending consumes the earliest-expiring unexpired lots first (FEFO). Balance, lot, and ledger changes run in a MongoDB transaction. Do not disable transactions or silently fall back to non-atomic updates: the deployment database must support MongoDB multi-document transactions (for example, a replica set or supported managed cluster). Otherwise wallet operations fail closed with HTTP 503.
 
