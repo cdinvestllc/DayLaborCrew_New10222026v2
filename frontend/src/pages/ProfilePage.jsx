@@ -370,6 +370,10 @@ export default function ProfilePage() {
   };
 
   const profilePhoto = user?.profile_photo || user?.logo;
+  const tokenProEntitled = user?.billing_mode === "tokens_v1" && (
+    (user?.billing_subscription_status === "active" && ["pro_crew", "pro_contractor"].includes(user?.billing_plan)) ||
+    (user?.billing_subscription_status === "trial" && user?.token_trial_end_at && new Date(user.token_trial_end_at) > new Date())
+  );
 
 
   return (
@@ -415,7 +419,7 @@ export default function ProfilePage() {
                 <span className="text-sm text-slate-500 ml-1">({user?.rating_count || 0})</span>
               </div>
 
-              {user?.role === "crew" && user?.billing_mode === "tokens_v1" && (
+              {user?.role === "crew" && tokenProEntitled && (
                 <div className="mt-4 rounded-xl border border-indigo-200 dark:border-indigo-800 bg-indigo-50/70 dark:bg-indigo-950/30 p-3 text-left">
                   <div className="flex items-center gap-2 mb-1">
                     <Zap className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
