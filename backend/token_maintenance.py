@@ -58,15 +58,24 @@ async def _convert_unused_legacy_job_credits(user: dict, *, cutover_at: datetime
     if not end or end > cutover_at:
         return 0
     # The legacy quota counter resets when the subscription-period start changes.
+    # A missing/stale valid period means no credits were consumed in the final period;
+    # do not mistake the old period's used count for current-period usage.
     period_days = 30
     expected_period = (end - timedelta(days=period_days)).date().isoformat()
-    if str(user.get("job_post_period") or "")[:10] != expected_period:
-        return 0
-    used_value = user.get("job_posts_used", 0)
-    try:
-        used = max(0, int(used_value or 0))
-    except (TypeError, ValueError):
-        used = quota
+    recorded_period = str(user.get("job_post_period") or "")[:10]
+    if recorded_period:
+        try:
+            datetime.fromisoformat(recorded_period)
+        except ValueError:
+            return 0
+    if recorded_period == expected_period:
+        used_value = user.get("job_posts_used", 0)
+        try:
+            used = max(0, int(used_value or 0))
+        except (TypeError, ValueError):
+            used = quota
+    else:
+        used = 0
     remaining = max(0, quota - min(quota, used))
     if remaining <= 0:
         return 0
