@@ -119,10 +119,6 @@ def test_duplicate_subscription_period_uses_same_ledger_idempotency_key(monkeypa
     assert len(wallet.calls) == 2  # two delivery attempts, one unique ledger operation
     assert wallet.calls[0][2]["idempotency_key"] == wallet.calls[1][2]["idempotency_key"]
     assert wallet.calls[0][2]["metadata"] == wallet.calls[1][2]["metadata"]
-    subscription_patch = database.billing_subscriptions.updates[-1][1]["$set"]
-    assert subscription_patch["next_grant_index"] == 1
-    assert subscription_patch["current_period_start"] == anchor.isoformat()
-    assert datetime.fromisoformat(subscription_patch["next_token_grant_at"]) == token_payments._add_months_anchored(anchor, 1)
     assert wallet.calls[0][2]["reference_id"] == wallet.calls[1][2]["reference_id"]
     assert wallet.calls[0][2]["idempotency_key"].startswith("subgrant:billing-sub-123:")
 
@@ -156,6 +152,10 @@ def test_annual_scheduler_and_invoice_paths_use_identical_grant_metadata(monkeyp
     assert scheduled_result["already_processed"] is True
     assert wallet.calls[0][2]["idempotency_key"] == wallet.calls[1][2]["idempotency_key"]
     assert wallet.calls[0][2]["metadata"] == wallet.calls[1][2]["metadata"]
+    subscription_patch = database.billing_subscriptions.updates[-1][1]["$set"]
+    assert subscription_patch["next_grant_index"] == 1
+    assert subscription_patch["current_period_start"] == anchor.isoformat()
+    assert datetime.fromisoformat(subscription_patch["next_token_grant_at"]) == token_payments._add_months_anchored(anchor, 1)
 
 
 def test_unpaid_stripe_token_pack_never_calls_wallet_grant(monkeypatch):
