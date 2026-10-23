@@ -86,7 +86,7 @@ async def _classify_legacy_users(limit: int) -> dict[str, int]:
             "token_plan": ("trial_crew" if user["role"] == "crew" else "trial_contractor") if trial_end else ("free_crew" if user["role"] == "crew" else "free_contractor"),
             "billing_plan": ("trial_crew" if user["role"] == "crew" else "trial_contractor") if trial_end else ("free_crew" if user["role"] == "crew" else "free_contractor"),
             "billing_subscription_status": "trial" if trial_end else "free",
-            "token_free_period_start": utc_iso(trial_end or now),
+            "token_free_period_start": utc_iso(now),
             "token_welcome_expiry_at": utc_iso(welcome_expiry),
             "token_billing_migration_v1": True,
             "token_billing_migrated_at": utc_iso(now)
@@ -210,11 +210,61 @@ async def _downgrade_expired_trials(limit: int) -> int:
             {"id": user["id"], "billing_subscription_status": "trial",
              "token_trial_end_at": {"$lte": now_text}, "billing_subscription_id": {"$exists": False}},
             {"$set": {"billing_subscription_status": "free", "billing_plan": role_plan,
-                      "token_plan": role_plan, "token_trial_downgraded_at": now_text,
-                      "token_free_period_start": now_text}}
+                      "token_plan": role_plan, "token_trial_downgraded_at": now_text}}
         )
         changed += int(result.modified_count > 0)
     return changed
+
+
+async def _downgrade_expired_paid_subscriptions(limit: int) -> int:
+    now_text = utc_iso()
+    cursor = db.users.find(
+        {"billing_mode": "tokens_v1",
+         "billing_subscription_status": {"$in": ["cancelled", "canceled", "expired", "suspended", "past_due"]},
+         "billing_subscription_period_end": {"$lte": now_text}},
+        {"_id": 0, "id": 1, "role": 1}
+    ).limit(max(1, min(limit, 1000)))
+    users = await cursor.to_list(length=max(1, min(limit, 1000)))
+    changed = 0
+    for user in users:
+        plan = "free_crew" if user["role"] == "crew" else "free_contractor"
+        result = await db.users.update_one(
+            {"id": user["id"],
+             "billing_subscription_status": {"$in": ["cancelled", "canceled", "expired", "suspended", "past_due"]},
+             "billing_subscription_period_end": {"$lte": now_text}},
+            {"$set": {"billing_subscription_status": "free", "billing_plan": plan, "token_plan": plan,
+                      "token_subscription_downgraded_at": now_text, "token_free_period_start": now_text}}
+        )
+        changed += int(result.modified_count > 0)
+    return changed
+
+
+async def _expire_portfolio_videos(limit: int) -> int:
+    now_text = utc_iso()
+    cursor = db.users.find(
+        {"portfolio_videos.expires_at": {"$lte": now_text}},
+        {"_id": 0, "id": 1, "portfolio_videos": 1}
+    ).limit(max(1, min(limit, 1000)))
+    users = await cursor.to_list(length=max(1, min(limit, 1000)))
+    removed = 0
+    for user in users:
+        expired = [video for video in (user.get("portfolio_videos") or [])
+                   if _dt(video.get("expires_at")) and _dt(video.get("expires_at")) <= utc_now()]
+        for video in expired:
+            url = video.get("url")
+            prefix = "/api/public/files/"
+            if isinstance(url, str) and url.startswith(prefix):
+                storage_path = url[len(prefix):]
+                await db.files.update_one(
+                    {"storage_path": storage_path}, {"$set": {"is_deleted": True, "deleted_at": now_text}}
+                )
+        if expired:
+            result = await db.users.update_one(
+                {"id": user["id"]},
+                {"$pull": {"portfolio_videos": {"expires_at": {"$lte": now_text}}}}
+            )
+            removed += len(expired) if result.modified_count else 0
+    return removed
 
 
 async def _issue_qualified_free_grants(limit: int) -> dict[str, int]:
@@ -365,6 +415,8 @@ async def run_token_maintenance(limit: int = 250) -> dict[str, Any]:
     results["legacy_cutovers"] = await _cut_over_expired_legacy_users(bounded)
     results["starter_grants"] = await _ensure_starter_and_trial_grants(bounded)
     results["trials_downgraded"] = await _downgrade_expired_trials(bounded)
+    results["paid_subscriptions_downgraded"] = await _downgrade_expired_paid_subscriptions(bounded)
+    results["expired_portfolio_videos_removed"] = await _expire_portfolio_videos(bounded)
     results["referral_activities_recorded"] = await _record_verified_referral_activities(bounded)
     results["free_grants"] = await _issue_qualified_free_grants(bounded)
     results["reservation_reconciliation"] = await _reconcile_reservations(min(bounded, 500))
