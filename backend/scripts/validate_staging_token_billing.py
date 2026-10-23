@@ -47,21 +47,30 @@ async def verify_mongo_transactions(mongo_uri: str, db_name: str) -> None:
         if not hello.get("logicalSessionTimeoutMinutes"):
             raise RuntimeError("MongoDB logical sessions are unavailable")
         target_db = client[db_name]
+        # Pre-create the collection outside the transaction so this works on MongoDB
+        # versions that forbid implicit collection creation inside a transaction.
+        await target_db.token_staging_preflight.create_index("purpose")
         probe_id = f"token-billing-preflight-{uuid.uuid4()}"
+
+        class _IntentionalAbort(Exception):
+            pass
 
         async def transaction(session):
             await target_db.token_staging_preflight.insert_one(
                 {"_id": probe_id, "purpose": "transaction-capability-check"},
                 session=session,
             )
-            await target_db.token_staging_preflight.delete_one(
-                {"_id": probe_id}, session=session
-            )
+            raise _IntentionalAbort()
 
         async with await client.start_session() as session:
-            await session.with_transaction(transaction)
+            try:
+                await session.with_transaction(transaction)
+            except _IntentionalAbort:
+                pass
+            else:
+                raise RuntimeError("MongoDB preflight transaction did not abort as expected")
         if await target_db.token_staging_preflight.count_documents({"_id": probe_id}):
-            raise RuntimeError("MongoDB transaction smoke-test record was not rolled back")
+            raise RuntimeError("MongoDB transaction rollback left a staging probe record behind")
     except Exception as exc:
         raise RuntimeError(
             "MongoDB replica-set transaction check failed "
