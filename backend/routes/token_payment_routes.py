@@ -126,6 +126,11 @@ async def _indexes() -> None:
     await db.billing_subscriptions.create_index(
         [("user_id", 1), ("status", 1)], name="billing_user_subscription_status"
     )
+    await db.billing_subscriptions.create_index(
+        [("user_id", 1)], unique=True,
+        partialFilterExpression={"status": {"$in": ["pending", "checkout_completed", "active", "past_due", "suspended"]}},
+        name="uniq_current_token_subscription_per_user"
+    )
 
 
 async def _catalog() -> tuple[int, BillingCatalog]:
@@ -191,6 +196,8 @@ async def _begin_subscription(
     await _indexes()
     existing = await _find_request(db.billing_subscriptions, user["id"], provider, "subscription", request_key)
     if existing:
+        if existing.get("plan_id") != plan_id or existing.get("billing_interval") != interval:
+            raise HTTPException(status_code=409, detail="This idempotency key was already used for a different subscription plan or interval.")
         return existing
     live = await db.billing_subscriptions.find_one(
         {"user_id": user["id"], "status": {"$in": ["pending", "checkout_completed", "active", "past_due", "suspended"]}},
@@ -365,7 +372,10 @@ async def _grant_subscription_period(
         {"id": sub["user_id"]},
         {"$set": {
             "billing_plan": sub["plan_id"], "billing_subscription_id": sub["id"],
-            "billing_subscription_status": "active", "billing_subscription_provider": sub["provider"]
+            "billing_subscription_status": "active", "billing_subscription_provider": sub["provider"],
+            "billing_subscription_interval": sub.get("billing_interval"),
+            "billing_subscription_period_end": utc_iso(period_end),
+            "billing_subscription_tokens_per_month": int(sub["monthly_tokens"])
         }}
     )
     return {
@@ -452,6 +462,13 @@ async def _process_stripe_invoice(invoice_value: Any, subscription_value: Any = 
         {"_id": sub["id"]},
         {"$addToSet": {"paid_invoice_ids": invoice.get("id")},
          "$set": {"last_invoice_id": invoice.get("id"), "updated_at": utc_iso()}}
+    )
+    await db.billing_payments.update_one(
+        {"subscription_id": sub["id"], "kind": "subscription_checkout"},
+        {"$set": {
+            "status": "fulfilled", "last_paid_invoice_id": invoice.get("id"),
+            "fulfilled_at": utc_iso(), "updated_at": utc_iso()
+        }}
     )
     return True
 
