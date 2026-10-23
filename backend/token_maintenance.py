@@ -41,6 +41,66 @@ def _legacy_paid_active(user: dict, now: datetime) -> bool:
     )
 
 
+async def _convert_unused_legacy_job_credits(user: dict, *, cutover_at: datetime) -> int:
+    """Convert only unused credits from the final paid contractor period, once.
+
+    Credits are converted before billing_mode changes; a failed ledger write therefore leaves
+    the account on legacy billing so the scheduler can safely retry.
+    """
+    if user.get("role") != "contractor":
+        return 0
+    plan = user.get("subscription_plan")
+    quotas = {"contractor_basic": 4, "contractor_pro": 10, "contractor_business": 20}
+    quota = quotas.get(plan)
+    if not quota:
+        return 0
+    end = _dt(user.get("subscription_end"))
+    if not end or end > cutover_at:
+        return 0
+    # The legacy quota counter resets when the subscription-period start changes.
+    period_days = 30
+    expected_period = (end - timedelta(days=period_days)).date().isoformat()
+    if str(user.get("job_post_period") or "")[:10] != expected_period:
+        return 0
+    used_value = user.get("job_posts_used", 0)
+    try:
+        used = max(0, int(used_value or 0))
+    except (TypeError, ValueError):
+        used = quota
+    remaining = max(0, quota - min(quota, used))
+    if remaining <= 0:
+        return 0
+
+    _, catalog = await active_catalog()
+    token_amount = remaining * int(catalog.token_costs.contractor_post_job)
+    if token_amount <= 0:
+        return 0
+    expiry = cutover_at + timedelta(days=int(catalog.token_policy.free_paid_token_expiry_days))
+    period_key = f"legacy-post-credit:{user['id']}:{expected_period}"
+    result = await wallet.grant_tokens(
+        user["id"], token_amount,
+        idempotency_key=period_key,
+        reason=f"Convert {remaining} unused legacy job-post credits from period {expected_period}",
+        source="legacy_credit_conversion", expires_at=expiry,
+        metadata={
+            "legacy_plan": plan, "legacy_period_start": expected_period,
+            "legacy_quota": quota, "legacy_used": used, "legacy_credits_converted": remaining,
+            "tokens_per_credit": int(catalog.token_costs.contractor_post_job), "policy_version": 1
+        },
+        reference_id=f"{user['id']}:{expected_period}"
+    )
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {
+            "legacy_credit_conversion_done": True,
+            "legacy_credit_conversion_period": expected_period,
+            "legacy_credit_conversion_tokens": token_amount,
+            "legacy_credit_conversion_at": utc_iso(cutover_at)
+        }}
+    )
+    return token_amount if not result.get("already_processed") else 0
+
+
 async def _classify_legacy_users(limit: int) -> dict[str, int]:
     now = utc_now()
     _, catalog = await active_catalog()
@@ -53,7 +113,7 @@ async def _classify_legacy_users(limit: int) -> dict[str, int]:
          "billing_mode": {"$nin": ["tokens_v1", "legacy_compat"]}},
         {"_id": 0, "id": 1, "role": 1, "billing_mode": 1, "subscription_status": 1,
          "subscription_plan": 1, "subscription_end": 1, "trial_end_date": 1,
-         "created_at": 1, "billing_subscription_id": 1}
+         "created_at": 1, "billing_subscription_id": 1, "subscription_plan": 1, "subscription_end": 1,\n         "job_post_period": 1, "job_posts_used": 1, "legacy_credit_conversion_done": 1}
     ).limit(max(1, min(limit, 1000)))
     users = await cursor.to_list(length=max(1, min(limit, 1000)))
     for user in users:
@@ -73,6 +133,10 @@ async def _classify_legacy_users(limit: int) -> dict[str, int]:
             )
             grandfathered += 1
             continue
+        if user.get("subscription_plan") in LEGACY_PAID_PLANS and _dt(user.get("subscription_end")) and _dt(user.get("subscription_end")) <= now:
+            # Don't flip the billing mode until the unused final-period quota is either
+            # converted or explicitly determined not convertible.
+            await _convert_unused_legacy_job_credits(user, cutover_at=now)
 
         # Legacy trial accounts receive a bounded, no-auto-charge 14-day Pro trial if
         # their prior trial is still active. Everyone else transitions to Free.
@@ -107,11 +171,13 @@ async def _cut_over_expired_legacy_users(limit: int) -> int:
     expiry_days = catalog.token_policy.welcome_grant_expiry_days
     cursor = db.users.find(
         {"billing_mode": "legacy_compat", "legacy_token_cutover_at": {"$lte": utc_iso(now)}},
-        {"_id": 0, "id": 1, "role": 1}
+        {"_id": 0, "id": 1, "role": 1, "subscription_plan": 1, "subscription_end": 1,
+         "job_post_period": 1, "job_posts_used": 1, "legacy_credit_conversion_done": 1}
     ).limit(max(1, min(limit, 1000)))
     users = await cursor.to_list(length=max(1, min(limit, 1000)))
     changed = 0
     for user in users:
+        await _convert_unused_legacy_job_credits(user, cutover_at=now)
         now_text = utc_iso()
         expiry = utc_iso(now + timedelta(days=expiry_days))
         result = await db.users.update_one(
