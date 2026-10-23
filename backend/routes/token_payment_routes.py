@@ -18,8 +18,7 @@ from typing import Any, Literal
 
 import httpx
 import stripe as stripe_sdk
-from dateutil.relativedelta import relativedelta
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from pymongo.errors import DuplicateKeyError
 
@@ -157,7 +156,7 @@ async def _create_payment_record(
         "_id": payment_id, "user_id": user_id, "provider": provider, "kind": kind,
         "request_key": request_key, "amount_cents": amount_cents, "currency": currency,
         "catalog_version": catalog_version, "status": "pending",
-        "created_at": utc_iso(), "updated_at": utc_iso(), **extra
+        "id": payment_id, "created_at": utc_iso(), "updated_at": utc_iso(), **extra
     }
     try:
         await db.billing_payments.insert_one(record)
@@ -578,6 +577,7 @@ async def stripe_subscription_session(data: SubscriptionCheckoutRequest, current
         catalog=catalog, plan=plan, price_cents=price_cents
     )
     local_id = sub["id"]
+    price_cents = int(sub["price_cents"])
     payment_id = f"checkout-{local_id}"
     await _create_payment_record(
         payment_id=payment_id, user_id=current_user["id"], provider="stripe", kind="subscription_checkout",
@@ -675,6 +675,8 @@ async def paypal_subscription(data: SubscriptionCheckoutRequest, current_user: d
         request_key=data.request_key, catalog_version=version, catalog=catalog,
         plan=plan, price_cents=price_cents, provider_plan_id=paypal_plan_id
     )
+    price_cents = int(sub["price_cents"])
+    paypal_plan_id = sub.get("provider_plan_id") or paypal_plan_id
     origin = legacy_payments._origin(None, {"origin_url": data.origin_url})
     try:
         response = await _paypal_request("POST", "/v1/billing/subscriptions", json_body={
@@ -761,6 +763,17 @@ async def paypal_token_pack_capture(order_id: str, current_user: dict = Depends(
     return await _capture_paypal_pack(order_id, current_user["id"])
 
 
+@router.post("/payments/paypal/token-pack-capture-payment/{payment_id}")
+async def paypal_token_pack_capture_payment(payment_id: str, current_user: dict = Depends(get_current_user)):
+    payment = await db.billing_payments.find_one(
+        {"_id": payment_id, "user_id": current_user["id"], "provider": "paypal", "kind": "token_pack"},
+        {"_id": 0, "provider_session_id": 1}
+    )
+    if not payment or not payment.get("provider_session_id"):
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return await _capture_paypal_pack(payment["provider_session_id"], current_user["id"])
+
+
 @router.get("/payments/paypal/subscription-status/{subscription_id}")
 async def paypal_subscription_status(subscription_id: str, current_user: dict = Depends(get_current_user)):
     sub = await db.billing_subscriptions.find_one({"_id": subscription_id, "user_id": current_user["id"], "provider": "paypal"}, {"_id": 0})
@@ -824,7 +837,7 @@ async def stripe_token_payment_status(session_id: str, current_user: dict = Depe
 
 @router.post("/payments/release-due-grants")
 async def release_due_annual_subscription_grants(
-    authorization: str | None = None,
+    authorization: str | None = Header(default=None, alias="Authorization"),
     limit: int = Query(100, ge=1, le=500)
 ):
     """Scheduler endpoint: call daily with Authorization: Bearer BILLING_SCHEDULER_SECRET."""
