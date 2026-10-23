@@ -1,4 +1,6 @@
 import uuid
+import hashlib
+import json
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, Header
 from database import db
@@ -75,6 +77,10 @@ async def create_job(
     if not location:
         raise HTTPException(status_code=400, detail="We couldn't locate that address. Please pick a suggested address.")
     images = _validated_job_images(data.images, current_user["id"])
+    request_fingerprint = hashlib.sha256(json.dumps(
+        {"payload": data.model_dump(mode="json"), "location": location, "images": images},
+        sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")).hexdigest()
     from token_actions import active_catalog, execute_token_action, record_qualifying_activity, uses_token_billing
     from token_billing import utc_iso
     token_mode = uses_token_billing(current_user)
@@ -89,8 +95,11 @@ async def create_job(
             {"user_id": current_user["id"], "idempotency_key": action_key}, {"_id": 0}
         )
         if existing_reservation:
-            if (existing_reservation.get("metadata") or {}).get("action_type") != "job_posting":
+            existing_metadata = existing_reservation.get("metadata") or {}
+            if existing_metadata.get("action_type") != "job_posting":
                 raise HTTPException(status_code=409, detail="Idempotency-Key was used for a different action.")
+            if existing_metadata.get("request_fingerprint") != request_fingerprint:
+                raise HTTPException(status_code=409, detail="Idempotency-Key was already used with different job details.")
             original_job_id = existing_reservation.get("reference_id")
             if original_job_id:
                 job_id = original_job_id
@@ -118,7 +127,7 @@ async def create_job(
                             "token_balance": balance["balance"], "already_processed": True}
     if token_mode:
         if not action_key:
-            action_key = f"jobpost:{job_id}"
+            raise HTTPException(status_code=400, detail="Idempotency-Key is required for token-funded job postings.")
         _, catalog = await active_catalog()
         cost = int(catalog.token_costs.contractor_post_job)
         if is_emergency:
@@ -146,7 +155,8 @@ async def create_job(
             current_user, amount=cost, idempotency_key=action_key,
             reason="Post emergency job" if is_emergency else "Post contractor job",
             action=persist_job, reference_id=job_id,
-            metadata={"action_type": "job_posting", "job_id": job_id, "emergency": is_emergency}
+            metadata={"action_type": "job_posting", "job_id": job_id, "emergency": is_emergency,
+                      "request_fingerprint": request_fingerprint}
         )
         saved = result.get("result")
         if not saved:
