@@ -73,6 +73,8 @@ DEFAULT_BILLING_CATALOG: dict[str, Any] = {
         "trial_tokens_expire_at": "trial_end",
         "trial_crew_tokens": 10,
         "trial_contractor_tokens": 20,
+        "welcome_tokens": 10,
+        "welcome_grant_expiry_days": 30,
         "active_free_tasks_required": 2,
         "active_free_period_days": 30,
         "qualifying_activities": [
