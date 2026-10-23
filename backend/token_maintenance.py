@@ -127,7 +127,8 @@ async def _classify_legacy_users(limit: int) -> dict[str, int]:
          "billing_mode": {"$nin": ["tokens_v1", "legacy_compat"]}},
         {"_id": 0, "id": 1, "role": 1, "billing_mode": 1, "subscription_status": 1,
          "subscription_plan": 1, "subscription_end": 1, "trial_end_date": 1,
-         "created_at": 1, "billing_subscription_id": 1, "subscription_plan": 1, "subscription_end": 1,\n         "job_post_period": 1, "job_posts_used": 1, "legacy_credit_conversion_done": 1}
+         "created_at": 1, "billing_subscription_id": 1, "subscription_plan": 1, "subscription_end": 1,
+         "job_post_period": 1, "job_posts_used": 1, "legacy_credit_conversion_done": 1}
     ).limit(max(1, min(limit, 1000)))
     users = await cursor.to_list(length=max(1, min(limit, 1000)))
     for user in users:
