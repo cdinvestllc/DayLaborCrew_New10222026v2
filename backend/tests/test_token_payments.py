@@ -75,6 +75,7 @@ class IdempotentFakeWallet:
 def test_exact_amount_verification_rejects_price_currency_and_bad_values():
     assert token_payments._amount_is_exact("9.99", 999, "USD", "usd")
     assert not token_payments._amount_is_exact("9.98", 999, "USD", "usd")
+    assert not token_payments._amount_is_exact("9.9901", 999, "USD", "usd")
     assert not token_payments._amount_is_exact("9.99", 999, "EUR", "usd")
     assert not token_payments._amount_is_exact("NaN", 999, "USD", "usd")
     assert not token_payments._amount_is_exact(None, 999, "USD", "usd")
