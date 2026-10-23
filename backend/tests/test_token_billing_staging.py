@@ -263,25 +263,28 @@ def test_legacy_unused_job_credits_convert_once(monkeypatch):
         subscription_end = cutover - timedelta(days=2)
         expected_period = (subscription_end - timedelta(days=30)).date().isoformat()
         user = {
-            "id": user_id, "role": "contractor", "subscription_plan": "contractor_business",
+            "id": user_id, "role": "contractor", "billing_mode": "legacy_compat",
+            "legacy_token_cutover_at": utc_iso(cutover - timedelta(minutes=1)),
+            "subscription_plan": "contractor_business",
             "subscription_end": subscription_end.isoformat(), "job_post_period": expected_period,
             "job_posts_used": 7,
         }
         await db.users.insert_one(user)
-        first = await token_maintenance._convert_unused_legacy_job_credits(user, cutover_at=cutover)
-        refreshed = await db.users.find_one({"id": user_id}, {"_id": 0})
-        second = await token_maintenance._convert_unused_legacy_job_credits(refreshed, cutover_at=cutover)
+        first_cutover = await token_maintenance._cut_over_expired_legacy_users(limit=10)
+        second_cutover = await token_maintenance._cut_over_expired_legacy_users(limit=10)
         entry = await db.token_ledger.find_one({
             "user_id": user_id, "idempotency_key": f"legacy-post-credit:{user_id}:{expected_period}",
             "operation": "grant",
         })
-        assert first == 130
-        assert second == 0
+        assert first_cutover == 1
+        assert second_cutover == 0
         assert entry is not None
         assert entry["amount"] == 130
         assert entry["source"] == "legacy_credit_conversion"
         assert (await wallet.wallet_summary(user_id))["balance"] == 130
         saved = await db.users.find_one({"id": user_id})
+        assert saved["billing_mode"] == "tokens_v1"
+        assert saved["billing_plan"] == "free_contractor"
         assert saved["legacy_credit_conversion_done"] is True
 
     try:
