@@ -24,6 +24,7 @@ sys.path.insert(0, str(BACKEND_ROOT / "tests"))
 
 import httpx
 import pytest
+from unittest.mock import AsyncMock
 
 from staging_config import validate_staging_configuration
 from database import db
@@ -349,8 +350,15 @@ def test_stripe_signed_webhook_redelivery_grants_token_pack_once():
         run(clean_user(user_id, payment_id))
 
 
-def test_paypal_capture_webhook_redelivery_fulfills_token_pack_once():
-    import routes.token_payment_routes as token_payments
+def test_paypal_capture_webhook_redelivery_fulfills_token_pack_once(monkeypatch):
+    from server import app
+    import routes.payment_routes as payment_routes
+
+    # PayPal signatures include provider-generated transmission headers that a synthetic
+    # fixture cannot validly produce. The preflight separately authenticates the sandbox
+    # app and validates this staging webhook registration. This test focuses on HTTP
+    # dispatch and duplicate fulfillment once the provider event has been verified.
+    monkeypatch.setattr(payment_routes, "_verify_paypal_webhook", AsyncMock(return_value=None))
 
     user_id = f"staging-token-paypal-{uuid.uuid4().hex}"
     payment_id = f"staging-token-payment-{uuid.uuid4().hex}"
@@ -375,8 +383,19 @@ def test_paypal_capture_webhook_redelivery_fulfills_token_pack_once():
                 "supplementary_data": {"related_ids": {"order_id": order_id}},
             },
         }
-        assert await token_payments.handle_paypal_event(event) is True
-        assert await token_payments.handle_paypal_event(event) is True
+        payload = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://staging.test") as client:
+            first = await client.post(
+                "/api/payments/paypal/webhook", content=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            second = await client.post(
+                "/api/payments/paypal/webhook", content=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        assert first.status_code == 200, f"first PayPal event returned HTTP {first.status_code}"
+        assert second.status_code == 200, f"redelivered PayPal event returned HTTP {second.status_code}"
         assert (await db.billing_payments.find_one({"_id": payment_id}))["status"] == "fulfilled"
         assert await db.token_ledger.count_documents({
             "user_id": user_id, "idempotency_key": f"tokenpack:{payment_id}", "operation": "grant"
