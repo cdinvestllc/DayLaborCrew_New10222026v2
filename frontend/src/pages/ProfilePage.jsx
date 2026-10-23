@@ -118,6 +118,8 @@ export default function ProfilePage() {
   const [profileBoostCost, setProfileBoostCost] = useState(10);
   const [portfolioVideoCost, setPortfolioVideoCost] = useState(2);
   const videoRef = useRef(null);
+  const videoUploadRetry = useRef(null);
+  const profileBoostRequestKey = useRef(null);
   const [tradeOptions, setTradeOptions] = useState(TRADES);
   const [privacy, setPrivacy] = useState({});
   const fileRef = useRef(null);
@@ -268,15 +270,23 @@ export default function ProfilePage() {
   const handleProfileBoost = async () => {
     setProfileBoosting(true);
     try {
-      const key = `profileboost:${user.id}:${user.profile_boost_expires_at || "initial"}`;
+      if (!profileBoostRequestKey.current) {
+        const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        profileBoostRequestKey.current = `profileboost:${user.id}:${requestId}`;
+      }
       const res = await axios.post(`${API}/billing/features/profile/boost`, {}, {
-        headers: { "Idempotency-Key": key }
+        headers: { "Idempotency-Key": profileBoostRequestKey.current }
       });
+      profileBoostRequestKey.current = null;
       updateUser({ profile_featured: true, profile_boost_expires_at: res.data.profile_boost_expires_at });
       toast.success(`Profile featured for 7 days. ${res.data.tokens_charged || profileBoostCost} tokens charged.`);
       await refreshUser();
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Could not boost profile");
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        profileBoostRequestKey.current = null;
+      }
+      toast.error(detail || "Could not boost profile");
     } finally {
       setProfileBoosting(false);
     }
@@ -294,20 +304,30 @@ export default function ProfilePage() {
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const fingerprint = `${file.name}:${file.size}:${file.lastModified}`;
+      if (!videoUploadRetry.current || videoUploadRetry.current.fingerprint !== fingerprint) {
+        const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        videoUploadRetry.current = { fingerprint, key: `portfoliovideo:${user.id}:${requestId}` };
+      }
       const res = await axios.post(`${API}/billing/features/portfolio/video`, formData, {
         headers: {
           "Content-Type": "multipart/form-data",
-          "Idempotency-Key": `portfoliovideo:${user.id}:${requestId}`
+          "Idempotency-Key": videoUploadRetry.current.key
         }
       });
-      const videos = [...portfolioVideos, res.data.video].filter(Boolean);
+      videoUploadRetry.current = null;
+      const video = res.data.video;
+      const videos = video ? [...portfolioVideos.filter(v => v.id !== video.id), video] : portfolioVideos;
       setPortfolioVideos(videos);
       updateUser({ portfolio_videos: videos });
       toast.success(`Video added for 30 days. ${res.data.tokens_charged || portfolioVideoCost} tokens charged.`);
       await refreshUser();
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Could not upload portfolio video");
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        videoUploadRetry.current = null;
+      }
+      toast.error(detail || "Could not upload portfolio video");
     } finally {
       setVideoUploading(false);
     }
