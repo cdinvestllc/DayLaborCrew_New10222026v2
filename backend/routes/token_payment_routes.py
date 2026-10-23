@@ -146,6 +146,16 @@ def _ensure_provider_enabled(catalog: BillingCatalog, provider: str) -> None:
         raise HTTPException(status_code=503, detail=f"{provider.replace('_', ' ').title()} payments are not enabled")
 
 
+def _ensure_token_checkout_allowed(user: dict) -> None:
+    """Avoid selling tokens while an account is still consuming grandfathered legacy benefits."""
+    if user.get("billing_mode") == "legacy_compat":
+        cutover = user.get("legacy_token_cutover_at")
+        when = f" until {cutover}" if cutover else " until your legacy paid-through period ends"
+        raise HTTPException(status_code=409, detail=f"Your existing subscription is still on legacy billing{when}. Token checkout opens after cutover.")
+    if user.get("billing_mode") != "tokens_v1":
+        raise HTTPException(status_code=409, detail="Token billing migration has not completed for this account. Please retry after account migration.")
+
+
 async def _find_request(collection, user_id: str, provider: str, kind: str, request_key: str):
     return await collection.find_one({
         "user_id": user_id, "provider": provider, "kind": kind, "request_key": request_key
@@ -665,6 +675,7 @@ async def _create_token_pack_record(user: dict, provider: str, request_key: str,
 
 @router.post("/payments/stripe/subscription-session")
 async def stripe_subscription_session(data: SubscriptionCheckoutRequest, current_user: dict = Depends(get_current_user)):
+    _ensure_token_checkout_allowed(current_user)
     version, catalog, plan, price_cents = await _validate_subscription_request(current_user, "pro_crew" if current_user.get("role") == "crew" else "pro_contractor", data.interval)
     _ensure_provider_enabled(catalog, "stripe")
     existing = await _find_request(db.billing_subscriptions, current_user["id"], "stripe", "subscription", data.request_key)
@@ -721,6 +732,7 @@ async def stripe_subscription_session(data: SubscriptionCheckoutRequest, current
 
 @router.post("/payments/stripe/token-pack-session")
 async def stripe_token_pack_session(data: TokenPackCheckoutRequest, current_user: dict = Depends(get_current_user)):
+    _ensure_token_checkout_allowed(current_user)
     version, catalog = await _catalog()
     _ensure_provider_enabled(catalog, "stripe")
     if not catalog.token_pack.enabled:
@@ -757,6 +769,7 @@ async def stripe_token_pack_session(data: TokenPackCheckoutRequest, current_user
 
 @router.post("/payments/paypal/subscription")
 async def paypal_subscription(data: SubscriptionCheckoutRequest, current_user: dict = Depends(get_current_user)):
+    _ensure_token_checkout_allowed(current_user)
     plan_id = "pro_crew" if current_user.get("role") == "crew" else "pro_contractor"
     version, catalog, plan, price_cents = await _validate_subscription_request(current_user, plan_id, data.interval)
     _ensure_provider_enabled(catalog, "paypal")
@@ -802,6 +815,7 @@ async def paypal_subscription(data: SubscriptionCheckoutRequest, current_user: d
 
 @router.post("/payments/paypal/token-pack-order")
 async def paypal_token_pack_order(data: TokenPackCheckoutRequest, current_user: dict = Depends(get_current_user)):
+    _ensure_token_checkout_allowed(current_user)
     version, catalog = await _catalog()
     _ensure_provider_enabled(catalog, "paypal")
     if not catalog.token_pack.enabled:
