@@ -56,6 +56,34 @@ async def update_profile(data: ProfileUpdate, current_user: dict = Depends(get_c
     if update:
         await db.users.update_one({"id": current_user["id"]}, {"$set": update})
     updated = await db.users.find_one({"id": current_user["id"]}, {"_id": 0})
+    # Award a Free-tier qualifying activity only for an actual change to meaningful
+    # profile fields, and at most once per account-anchored 30-day period.
+    meaningful_fields = {
+        "bio", "trade", "skills", "certifications", "availability", "portfolio",
+        "profile_photo", "transportation", "is_insured", "location"
+    }
+    changed_meaningful = [
+        field for field in meaningful_fields
+        if field in update and update.get(field) != current_user.get(field)
+        and update.get(field) not in (None, "", [], {})
+    ]
+    if changed_meaningful:
+        from token_actions import record_qualifying_activity
+        from datetime import datetime, timezone
+        created_at = current_user.get("created_at")
+        try:
+            anchor = datetime.fromisoformat(created_at.replace("Z", "+00:00")) if isinstance(created_at, str) else datetime.now(timezone.utc)
+            if anchor.tzinfo is None:
+                anchor = anchor.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            anchor = datetime.now(timezone.utc)
+        elapsed_days = max(0, (datetime.now(timezone.utc) - anchor).total_seconds() // 86400)
+        period_index = int(elapsed_days // 30)
+        await record_qualifying_activity(
+            current_user["id"], "meaningful_profile_update",
+            f"profileupdate:{current_user['id']}:{period_index}",
+            metadata={"changed_fields": sorted(changed_meaningful), "period_index": period_index}
+        )
     return user_to_response(updated)
 
 
