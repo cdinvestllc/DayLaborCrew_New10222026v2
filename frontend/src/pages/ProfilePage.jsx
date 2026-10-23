@@ -279,7 +279,7 @@ export default function ProfilePage() {
       });
       profileBoostRequestKey.current = null;
       updateUser({ profile_featured: true, profile_boost_expires_at: res.data.profile_boost_expires_at });
-      toast.success(`Profile featured for 7 days. ${res.data.tokens_charged || profileBoostCost} tokens charged.`);
+      toast.success(`Profile featured for 7 days. ${res.data.tokens_charged ?? profileBoostCost} tokens charged.`);
       await refreshUser();
     } catch (e) {
       const detail = e?.response?.data?.detail || "";
@@ -320,7 +320,7 @@ export default function ProfilePage() {
       const videos = video ? [...portfolioVideos.filter(v => v.id !== video.id), video] : portfolioVideos;
       setPortfolioVideos(videos);
       updateUser({ portfolio_videos: videos });
-      toast.success(`Video added for 30 days. ${res.data.tokens_charged || portfolioVideoCost} tokens charged.`);
+      toast.success(`Video added for 30 days. ${res.data.tokens_charged ?? portfolioVideoCost} tokens charged.`);
       await refreshUser();
     } catch (e) {
       const detail = e?.response?.data?.detail || "";
