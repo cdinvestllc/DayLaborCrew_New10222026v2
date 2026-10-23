@@ -456,6 +456,32 @@ async def _process_stripe_invoice(invoice_value: Any, subscription_value: Any = 
     return True
 
 
+async def _mark_stripe_invoice_failed(invoice_value: Any) -> bool:
+    invoice = _to_dict(invoice_value)
+    subscription_id = invoice.get("subscription")
+    if isinstance(subscription_id, dict):
+        subscription_id = subscription_id.get("id")
+    if not subscription_id:
+        parent = invoice.get("parent") or {}
+        subscription_id = ((parent.get("subscription_details") or {}).get("subscription"))
+    if not subscription_id:
+        return False
+    subscription = await _retrieve_stripe_object(stripe_sdk.Subscription, str(subscription_id))
+    metadata = subscription.get("metadata") or {}
+    if metadata.get(TOKEN_METADATA_KEY) != TOKEN_METADATA_VALUE:
+        return False
+    local_id = metadata.get("billing_subscription_id")
+    sub = await db.billing_subscriptions.find_one({"_id": local_id}, {"_id": 0}) if local_id else None
+    if not sub or sub.get("provider_subscription_id") not in (None, subscription_id):
+        raise RuntimeError("Failed Stripe invoice did not match the local token subscription")
+    await db.billing_subscriptions.update_one(
+        {"_id": local_id, "status": {"$nin": ["cancelled", "expired", "refunded"]}},
+        {"$set": {"status": "past_due", "last_failed_invoice_id": invoice.get("id"), "updated_at": utc_iso()}}
+    )
+    await db.users.update_one({"billing_subscription_id": local_id}, {"$set": {"billing_subscription_status": "past_due"}})
+    return True
+
+
 async def handle_stripe_event(event_value: Any) -> bool:
     event = _to_dict(event_value)
     event_type = event.get("type")
@@ -490,6 +516,53 @@ async def handle_stripe_event(event_value: Any) -> bool:
                 {"$set": {"status": "provider_paid" if obj.get("payment_status") == "paid" else "pending",
                           "provider_subscription_id": obj.get("subscription"), "updated_at": utc_iso()}}
             )
+        return True
+    if event_type == "checkout.session.expired":
+        metadata = obj.get("metadata") or {}
+        if metadata.get(TOKEN_METADATA_KEY) != TOKEN_METADATA_VALUE:
+            return False
+        payment_id = metadata.get("billing_payment_id")
+        if payment_id:
+            payment = await db.billing_payments.find_one({"_id": payment_id}, {"_id": 0})
+            if payment and payment.get("status") != "fulfilled":
+                await db.billing_payments.update_one(
+                    {"_id": payment_id, "status": {"$nin": ["fulfilled", "refunded"]}},
+                    {"$set": {"status": "expired", "updated_at": utc_iso()}}
+                )
+                if payment.get("kind") == "subscription_checkout" and payment.get("subscription_id"):
+                    local_id = payment["subscription_id"]
+                    await db.billing_subscriptions.update_one(
+                        {"_id": local_id, "status": {"$in": ["pending", "checkout_completed"]},
+                         "first_grant_at": {"$exists": False}},
+                        {"$set": {"status": "expired", "updated_at": utc_iso()}}
+                    )
+        return True
+    if event_type in {"invoice.paid", "invoice.payment_failed"}:
+        return await _process_stripe_invoice(obj) if event_type == "invoice.paid" else await _mark_stripe_invoice_failed(obj)
+    if event_type == "customer.subscription.updated":
+        metadata = obj.get("metadata") or {}
+        if metadata.get(TOKEN_METADATA_KEY) != TOKEN_METADATA_VALUE:
+            return False
+        local_id = metadata.get("billing_subscription_id")
+        if not local_id:
+            return False
+        sub = await db.billing_subscriptions.find_one({"_id": local_id}, {"_id": 0})
+        if not sub or sub.get("provider") != "stripe":
+            return False
+        provider_status = str(obj.get("status") or "").lower()
+        if provider_status in {"canceled", "incomplete_expired"}:
+            new_status = "cancelled" if provider_status == "canceled" else "expired"
+        elif provider_status in {"past_due", "unpaid", "paused"}:
+            new_status = "past_due"
+        elif provider_status == "active":
+            new_status = "active" if sub.get("first_grant_at") else "checkout_completed"
+        else:
+            return True
+        await db.billing_subscriptions.update_one(
+            {"_id": local_id, "status": {"$nin": ["cancelled", "expired", "refunded"]}},
+            {"$set": {"status": new_status, "updated_at": utc_iso()}}
+        )
+        await db.users.update_one({"billing_subscription_id": local_id}, {"$set": {"billing_subscription_status": new_status}})
         return True
     if event_type == "invoice.paid":
         return await _process_stripe_invoice(obj)
