@@ -108,8 +108,13 @@ async def create_job(
                         current_user["id"], "job_posting", f"jobpost:{job_id}",
                         metadata={"job_id": job_id, "emergency": bool(existing_job.get("is_emergency"))}
                     )
+                    if not existing_job.get("token_publication_dispatched_at"):
+                        try:
+                            await _publish_token_job_after_commit(existing_job)
+                        except Exception as exc:
+                            logger.warning("Token job publication retry deferred: %s", type(exc).__name__)
                     balance = await __import__("token_billing").TokenWalletService(db).wallet_summary(current_user["id"])
-                    return {**existing_job, "tokens_charged": int(existing_reservation.get("amount", existing_job.get("token_cost", 0))),
+                    return {**existing_job, "tokens_charged": 0,
                             "token_balance": balance["balance"], "already_processed": True}
     if token_mode:
         if not action_key:
@@ -135,7 +140,6 @@ async def create_job(
             doc = {**job_doc, "token_reservation_id": reservation_id}
             await db.jobs.insert_one(doc)
             doc.pop("_id", None)
-            await publish_job(doc)
             return doc
 
         result = await execute_token_action(
@@ -155,7 +159,11 @@ async def create_job(
         )
         if not saved:
             raise HTTPException(status_code=503, detail="Job was saved but is still being reconciled; refresh your jobs shortly.")
-        return {**saved, "tokens_charged": cost, "token_balance": result["balance"],
+        try:
+            await _publish_token_job_after_commit(saved)
+        except Exception as exc:
+            logger.warning("Token job publication deferred: %s", type(exc).__name__)
+        return {**saved, "tokens_charged": 0 if result["already_processed"] else cost, "token_balance": result["balance"],
                 "already_processed": result["already_processed"]}
 
     # Legacy-paid accounts remain on the existing credit system until their paid-through
@@ -197,6 +205,17 @@ async def publish_job(job_doc: dict):
         logger.warning(f"WS broadcast failed: {e}")
     import asyncio
     asyncio.create_task(_run_ai_match(job_doc))
+
+
+async def _publish_token_job_after_commit(job_doc: dict) -> None:
+    """Notifications are post-commit side effects, never part of the refundable action."""
+    if not job_doc or job_doc.get("token_publication_dispatched_at"):
+        return
+    await publish_job(job_doc)
+    await db.jobs.update_one(
+        {"id": job_doc["id"], "token_publication_dispatched_at": {"$exists": False}},
+        {"$set": {"token_publication_dispatched_at": now_str()}}
+    )
 
 
 def _validated_job_images(images, user_id: str) -> list:
