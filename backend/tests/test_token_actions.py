@@ -291,3 +291,78 @@ def test_legacy_unused_credit_conversion_grants_full_quota_if_counter_is_from_pr
     }
     assert run(token_maintenance._convert_unused_legacy_job_credits(user, cutover_at=cutover)) == 40
     assert wallet.grant_tokens.await_args.kwargs["metadata"]["legacy_credits_converted"] == 4
+
+def test_free_grant_period_anchor_advances_monthly_without_drifting(monkeypatch):
+    import token_maintenance
+
+    anchor = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 10, 5, tzinfo=timezone.utc)
+    previous_start = anchor + timedelta(days=30)
+    expected_start = anchor + timedelta(days=60)
+
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+        def limit(self, _limit):
+            return self
+        async def to_list(self, length=None):
+            return self.rows[:length] if length is not None else self.rows
+
+    class Users:
+        def __init__(self):
+            self.updates = []
+        def find(self, query, projection=None):
+            return Cursor([{
+                "id": "free-user", "role": "crew", "is_verified": True,
+                "billing_mode": "tokens_v1", "billing_subscription_status": "free",
+                "billing_plan": "free_crew", "created_at": anchor.isoformat(),
+                "token_free_period_anchor": anchor.isoformat(),
+                "token_free_period_start": previous_start.isoformat(),
+                "last_free_token_grant_period": previous_start.isoformat()
+            }])
+        async def update_one(self, query, update):
+            self.updates.append((query, update))
+            return SimpleNamespace(modified_count=1)
+
+    class ActivityEvents:
+        async def count_documents(self, query):
+            assert query["created_at"]["$gte"] == expected_start.isoformat()
+            return 2
+
+    class Wallet:
+        def __init__(self):
+            self.calls = []
+        async def grant_tokens(self, user_id, amount, **kwargs):
+            self.calls.append((user_id, amount, kwargs))
+            return {"already_processed": False}
+
+    users = Users()
+    wallet = Wallet()
+    catalog = SimpleNamespace(
+        token_policy=SimpleNamespace(
+            active_free_period_days=30, active_free_tasks_required=2,
+            free_grant_expiry_days=30, qualifying_activities=["job_posting", "job_application"]
+        ),
+        plans={
+            "free_crew": SimpleNamespace(monthly_tokens=10),
+            "free_contractor": SimpleNamespace(monthly_tokens=10)
+        }
+    )
+    monkeypatch.setattr(token_maintenance, "utc_now", lambda: now)
+    monkeypatch.setattr(token_maintenance, "active_catalog", AsyncMock(return_value=(1, catalog)))
+    monkeypatch.setattr(token_maintenance, "wallet", wallet)
+    monkeypatch.setattr(token_maintenance, "db", SimpleNamespace(
+        users=users, token_activity_events=ActivityEvents()
+    ))
+
+    result = run(token_maintenance._issue_qualified_free_grants(100))
+    assert result["free_grants"] == 1
+    assert wallet.calls[0][0] == "free-user"
+    assert wallet.calls[0][1] == 10
+    assert wallet.calls[0][2]["idempotency_key"] == f"freegrant:free-user:{expected_start.isoformat()}"
+    period_start_updates = [
+        update["$set"]["token_free_period_start"]
+        for _query, update in users.updates if "token_free_period_start" in update.get("$set", {})
+    ]
+    assert period_start_updates == [expected_start.isoformat()]
+    assert not any("token_free_period_anchor" in update.get("$set", {}) for _query, update in users.updates)
