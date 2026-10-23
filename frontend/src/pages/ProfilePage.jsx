@@ -676,7 +676,7 @@ export default function ProfilePage() {
                 </div>
               )}
 
-              {user?.billing_mode === "tokens_v1" && (
+              {tokenProEntitled && (
                 <div className="mt-5 border-t border-slate-200 dark:border-slate-700 pt-4">
                   <div className="flex items-center justify-between gap-3 mb-3">
                     <div>
