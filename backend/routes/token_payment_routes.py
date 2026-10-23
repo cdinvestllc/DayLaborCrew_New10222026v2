@@ -98,7 +98,10 @@ def _amount_is_exact(actual: Any, expected_cents: int, currency: Any, expected_c
             return False
         if value > Decimal("1000000000") or value < 0:
             return False
-        cents = int((value * 100).quantize(Decimal("1")))
+        cents_value = value * 100
+        if cents_value != cents_value.to_integral_value():
+            return False
+        cents = int(cents_value)
     except (InvalidOperation, TypeError, ValueError):
         return False
     return str(currency or "").lower() == expected_currency.lower() and cents == expected_cents
