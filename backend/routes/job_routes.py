@@ -104,8 +104,13 @@ async def create_job(
                             )
                         except Exception:
                             raise HTTPException(status_code=503, detail="Job is saved; billing reconciliation is pending.") from None
+                    await record_qualifying_activity(
+                        current_user["id"], "job_posting", f"jobpost:{job_id}",
+                        metadata={"job_id": job_id, "emergency": bool(existing_job.get("is_emergency"))}
+                    )
                     balance = await __import__("token_billing").TokenWalletService(db).wallet_summary(current_user["id"])
-                    return {**existing_job, "token_balance": balance["balance"], "already_processed": True}
+                    return {**existing_job, "tokens_charged": int(existing_reservation.get("amount", existing_job.get("token_cost", 0))),
+                            "token_balance": balance["balance"], "already_processed": True}
     if token_mode:
         if not action_key:
             action_key = f"jobpost:{job_id}"
