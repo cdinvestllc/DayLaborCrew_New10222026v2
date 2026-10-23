@@ -50,13 +50,18 @@ Spending consumes the earliest-expiring unexpired lots first (FEFO). Balance, lo
 
 Retries must reuse the same idempotency key and the same operation parameters. Reusing a key for different parameters returns a conflict. Refunds should be represented by compensating ledger operations in a later phase; never edit historical entries.
 
-## Next migration steps
+## Provider configuration and operational release gates
 
-1. Add transactionally idempotent recurring Free/Pro grants and 14-day trial grant scheduling.
-2. Integrate provider checkout/webhooks with payment states and token grants only after provider confirmation.
-3. Switch job apply/post, emergency posts, boosts, portfolio video, and verification renewals to server-side token debits.
-4. Add reservations for operations that can fail after authorization; commit debit after the action succeeds, otherwise release the reservation.
-5. Reconcile existing job-post credits/subscriptions and choose a tested, audited migration before deprecating old fields.
-6. Add scheduled expiration notifications and UI affordances showing balances and expiry dates.
+- Stripe must have a valid `STRIPE_API_KEY`, explicit `STRIPE_MODE`, and `STRIPE_WEBHOOK_SECRET`. Subscribe the webhook to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.expired`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`, and `customer.subscription.deleted`. Keep the endpoint at `/api/payments/stripe/webhook`.
+- PayPal requires the existing `PAYPAL_CLIENT_ID`, `PAYPAL_SECRET`, `PAYPAL_MODE`, and `PAYPAL_WEBHOOK_ID`. Subscribe it to `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.SALE.COMPLETED`, `BILLING.SUBSCRIPTION.CANCELLED`, `BILLING.SUBSCRIPTION.SUSPENDED`, and `BILLING.SUBSCRIPTION.EXPIRED`.
+- Create/activate PayPal billing plans whose price/cadence match the catalog and configure `PAYPAL_PLAN_ID_PRO_CREW_MONTH`, `PAYPAL_PLAN_ID_PRO_CREW_YEAR`, `PAYPAL_PLAN_ID_PRO_CONTRACTOR_MONTH`, and `PAYPAL_PLAN_ID_PRO_CONTRACTOR_YEAR`. If a plan is missing or doesn't match the catalog, checkout fails closed.
+- Configure `BILLING_SCHEDULER_SECRET` and call `POST /api/billing/payments/release-due-grants` daily with `Authorization: Bearer <secret>`. The endpoint is protected and grants each annual subscriber's monthly allowance using the same subscription-period idempotency key as invoice processing. Until this scheduler is running, an annual purchaser receives only their first month's token grant.
+- MongoDB transactions must be enabled before exposing token wallet operations. Test webhook delivery, scheduled runs, and database failover in staging before launch.
 
-The API currently exposes only admin grants as a controlled way to seed tokens; it does not mint starter/recurring tokens or let users buy token packs yet.
+## Recommended next migration steps
+
+1. Enforce catalog-backed token spending on job applications, job posting, emergency surcharge, profile/job boosts, 30-second portfolio video, and contractor verification renewal. Use a reserve/action-commit/release pattern so a failed job action doesn't consume tokens.
+2. Add recurring Free-tier and 14-day trial grants, qualifying-activity counting, expiration notifications, and downgrade handling.
+3. Reconcile existing job-post credits/subscriptions and choose a tested, audited migration before deprecating old fields.
+4. Add compensating ledger entries for administrative corrections and provider refunds/chargebacks.
+5. Add Square/Cash App Pay adapter and crypto only after payment-provider operations and compliance review are complete.
