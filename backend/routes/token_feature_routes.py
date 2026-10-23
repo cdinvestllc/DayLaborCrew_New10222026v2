@@ -92,6 +92,8 @@ async def token_boost_job(
     job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "open":
+        raise HTTPException(status_code=409, detail="Only open jobs can be boosted.")
     if job.get("contractor_id") != current_user["id"] and current_user.get("role") not in {"admin", "super_admin"}:
         raise HTTPException(status_code=403, detail="Not your job")
     expiry = job.get("boost_expires_at")
@@ -276,8 +278,13 @@ async def upload_portfolio_video(
         current = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "portfolio_videos": 1})
         if not current:
             raise HTTPException(status_code=404, detail="User not found.")
-        if len(current.get("portfolio_videos") or []) >= MAX_PROFILE_VIDEOS:
-            raise HTTPException(status_code=400, detail=f"Maximum {MAX_PROFILE_VIDEOS} portfolio videos allowed.")
+        now_text = utc_iso()
+        active_videos = [
+            video for video in (current.get("portfolio_videos") or [])
+            if (parse_expiry := video.get("expires_at")) and parse_expiry > now_text
+        ]
+        if len(active_videos) >= MAX_PROFILE_VIDEOS:
+            raise HTTPException(status_code=400, detail=f"Maximum {MAX_PROFILE_VIDEOS} active portfolio videos allowed.")
         await file.seek(0)
         url = await save_video(file, current_user["id"], "portfolio_videos")
         now = utc_now()
@@ -288,7 +295,14 @@ async def upload_portfolio_video(
         }
         update = await db.users.update_one(
             {"id": current_user["id"],
-             "$expr": {"$lt": [{"$size": {"$ifNull": ["$portfolio_videos", []]}}, MAX_PROFILE_VIDEOS]},
+             "$expr": {"$lt": [
+                 {"$size": {"$filter": {
+                     "input": {"$ifNull": ["$portfolio_videos", []]},
+                     "as": "video",
+                     "cond": {"$gt": ["$video.expires_at", utc_iso(now)]}
+                 }}},
+                 MAX_PROFILE_VIDEOS
+             ]},
              "portfolio_videos.id": {"$ne": video_id}},
             {"$push": {"portfolio_videos": record}}
         )
