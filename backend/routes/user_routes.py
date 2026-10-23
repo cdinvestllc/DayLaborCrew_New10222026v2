@@ -79,11 +79,27 @@ async def update_profile(data: ProfileUpdate, current_user: dict = Depends(get_c
             anchor = datetime.now(timezone.utc)
         elapsed_days = max(0, (datetime.now(timezone.utc) - anchor).total_seconds() // 86400)
         period_index = int(elapsed_days // 30)
-        await record_qualifying_activity(
-            current_user["id"], "meaningful_profile_update",
-            f"profileupdate:{current_user['id']}:{period_index}",
+        pending_activity = {
+            "period_index": period_index,
+            "changed_fields": sorted(changed_meaningful),
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.users.update_one(
+            {"id": current_user["id"]},
+            {"$set": {"_token_profile_activity_pending": pending_activity}}
+        )
+        event_id = f"profileupdate:{current_user['id']}:{period_index}"
+        recorded = await record_qualifying_activity(
+            current_user["id"], "meaningful_profile_update", event_id,
             metadata={"changed_fields": sorted(changed_meaningful), "period_index": period_index}
         )
+        if recorded or await db.token_activity_events.find_one(
+            {"user_id": current_user["id"], "event_id": event_id}, {"_id": 1}
+        ):
+            await db.users.update_one(
+                {"id": current_user["id"]},
+                {"$unset": {"_token_profile_activity_pending": ""}}
+            )
     return user_to_response(updated)
 
 
