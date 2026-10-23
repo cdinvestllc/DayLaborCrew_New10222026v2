@@ -47,7 +47,7 @@ async def _convert_unused_legacy_job_credits(user: dict, *, cutover_at: datetime
     Credits are converted before billing_mode changes; a failed ledger write therefore leaves
     the account on legacy billing so the scheduler can safely retry.
     """
-    if user.get("role") != "contractor":
+    if user.get("role") != "contractor" or user.get("legacy_credit_conversion_done"):
         return 0
     plan = user.get("subscription_plan")
     quotas = {"contractor_basic": 4, "contractor_pro": 10, "contractor_business": 20}
@@ -77,6 +77,20 @@ async def _convert_unused_legacy_job_credits(user: dict, *, cutover_at: datetime
         return 0
     expiry = cutover_at + timedelta(days=int(catalog.token_policy.free_paid_token_expiry_days))
     period_key = f"legacy-post-credit:{user['id']}:{expected_period}"
+    existing_entry = await db.token_ledger.find_one(
+        {"user_id": user["id"], "idempotency_key": period_key}, {"_id": 0, "amount": 1}
+    )
+    if existing_entry:
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {
+                "legacy_credit_conversion_done": True,
+                "legacy_credit_conversion_period": expected_period,
+                "legacy_credit_conversion_tokens": int(existing_entry.get("amount", token_amount)),
+                "legacy_credit_conversion_at": utc_iso(cutover_at)
+            }}
+        )
+        return 0
     result = await wallet.grant_tokens(
         user["id"], token_amount,
         idempotency_key=period_key,
