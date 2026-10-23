@@ -739,7 +739,8 @@ async def stripe_webhook(request: Request):
     event_type = event.get("type")
     supported = {
         "checkout.session.completed", "checkout.session.async_payment_succeeded",
-        "invoice.paid", "invoice.payment_failed", "customer.subscription.updated",\n        "customer.subscription.deleted", "checkout.session.expired",
+        "invoice.paid", "invoice.payment_failed", "customer.subscription.updated",
+        "customer.subscription.deleted", "checkout.session.expired",
     }
     if event_type not in supported:
         return {"status": "ignored"}
