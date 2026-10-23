@@ -154,7 +154,7 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
               Pay with PayPal
             </button>
           </div>
-        ) : !tokenMode ? (
+        ) : !tokenMode && method ? (
           <div className="space-y-3">
             <div className="flex items-center gap-2 mb-1">
               <button onClick={() => setMethod(null)} className="text-xs text-slate-400 hover:text-slate-600">← Back</button>
@@ -176,7 +176,7 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
               )}
             </button>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
