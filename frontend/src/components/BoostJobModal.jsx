@@ -34,7 +34,7 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
         headers: { "Idempotency-Key": tokenBoostRequestKey.current }
       });
       tokenBoostRequestKey.current = null;
-      toast.success(`Job boosted for ${BOOST_DAYS} days. ${res.data.tokens_charged || tokenCost} tokens charged.`);
+      toast.success(`Job boosted for ${BOOST_DAYS} days. ${res.data.tokens_charged ?? tokenCost} tokens charged.`);
       onSuccess?.();
     } catch (err) {
       const detail = err?.response?.data?.detail || "";
