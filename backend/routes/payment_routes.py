@@ -201,6 +201,15 @@ GUEST_JOB_PRICE = 9.99
 STAFF_ROLES = ("admin", "super_admin")
 
 
+def _guard_legacy_cash_feature(user: dict, feature: str) -> None:
+    """Don't let token-mode accounts bypass catalog pricing via old cash checkout routes."""
+    if user.get("billing_mode") == "tokens_v1":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{feature} uses tokens for this account. Use the token billing endpoint instead."
+        )
+
+
 def _parse_dt(value):
     try:
         dt = datetime.fromisoformat(value) if isinstance(value, str) else value
@@ -943,6 +952,7 @@ BOOST_DURATION_DAYS = 7
 
 @router.post("/boost/stripe/{job_id}")
 async def boost_job_stripe(job_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "job boost")
     job = await db.jobs.find_one({"id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1015,6 +1025,7 @@ async def boost_stripe_status(session_id: str, request: Request, current_user: d
 
 @router.post("/boost/paypal/{job_id}")
 async def boost_job_paypal(job_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "job boost")
     job = await db.jobs.find_one({"id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1094,6 +1105,7 @@ async def boost_paypal_capture(order_id: str, job_id: str, current_user: dict = 
 
 @router.post("/verified-contractor/create-session")
 async def create_verified_contractor_session(request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "contractor verification")
     if current_user.get("role") != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can purchase verification")
     expires = _parse_dt(current_user.get("verified_expires_at"))
@@ -1434,6 +1446,7 @@ async def fulfill_emergency_tx(session_id: str) -> dict | None:
 
 @router.post("/emergency/stripe/{job_id}")
 async def emergency_checkout(job_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "emergency job posting")
     job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
     if not job or job["contractor_id"] != current_user["id"]:
         raise HTTPException(status_code=404, detail="Job not found")
