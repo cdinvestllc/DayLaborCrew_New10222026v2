@@ -99,6 +99,34 @@ def _require_action_id(key: str) -> str:
     return key
 
 
+async def _action_persisted(user_id: str, reservation_id: str, reference_id: str | None,
+                          metadata: dict[str, Any] | None) -> bool:
+    """Check durable business evidence before recovering a reserved action after a crash."""
+    action_type = (metadata or {}).get("action_type")
+    if action_type == "job_posting":
+        found = await db.jobs.find_one({"id": reference_id, "token_reservation_id": reservation_id}, {"_id": 1})
+    elif action_type == "job_application":
+        found = await db.jobs.find_one(
+            {"id": reference_id,
+             "crew_acceptance_receipts": {"$elemMatch": {"crew_id": user_id, "reservation_id": reservation_id}}},
+            {"_id": 1}
+        )
+    elif action_type == "job_boost":
+        found = await db.jobs.find_one({"id": reference_id, "token_boost_reservation_id": reservation_id}, {"_id": 1})
+    elif action_type == "profile_boost":
+        found = await db.users.find_one({"id": user_id, "profile_boost_reservation_id": reservation_id}, {"_id": 1})
+    elif action_type == "verification_renewal":
+        found = await db.users.find_one({"id": user_id, "verification_token_reservation_id": reservation_id}, {"_id": 1})
+    elif action_type == "portfolio_video":
+        found = await db.users.find_one(
+            {"id": user_id, "portfolio_videos": {"$elemMatch": {"reservation_id": reservation_id}}},
+            {"_id": 1}
+        )
+    else:
+        return False
+    return found is not None
+
+
 async def execute_token_action(
     user: dict, *, amount: int, idempotency_key: str, reason: str, action: Callable[[str], Awaitable[Any]],
     metadata: dict[str, Any] | None = None, reference_id: str | None = None
@@ -118,7 +146,18 @@ async def execute_token_action(
             metadata=metadata or {}, reference_id=reference_id
         )
         if reserved["status"] == "committed":
-            return {"already_processed": True, "balance": reserved["balance"], "result": None}
+            return {"already_processed": True, "balance": reserved["balance"], "result": None,
+                    "reservation_id": reserved.get("reservation_id")}
+        if reserved.get("already_processed") and reserved["status"] == "reserved":
+            persisted = await _action_persisted(user["id"], reserved["reservation_id"], reference_id, metadata)
+            if persisted:
+                committed = await wallet.commit_reservation(
+                    user["id"], reserved["reservation_id"],
+                    metadata={"action_succeeded": True, "reconciled": True, "action": metadata or {}}
+                )
+                return {"already_processed": True, "balance": committed["balance"], "result": None,
+                        "reservation_id": reserved["reservation_id"]}
+            raise HTTPException(status_code=409, detail="This token action is already processing; retry with the same Idempotency-Key.")
         try:
             result = await action(reserved["reservation_id"])
         except Exception:
