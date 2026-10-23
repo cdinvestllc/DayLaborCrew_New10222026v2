@@ -194,15 +194,30 @@ async def search_crew(
             continue
         view = await build_user_view(member, current_user, include_coords=True)
         view["distance_miles"] = round(dist, 1) if dist is not None else None
+        boost_expiry = member.get("profile_boost_expires_at")
+        try:
+            expiry = datetime.fromisoformat(str(boost_expiry).replace("Z", "+00:00")) if boost_expiry else None
+            if expiry and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            expiry = None
+        view["_token_featured_rank"] = bool(
+            member.get("profile_featured") and expiry and expiry > datetime.now(timezone.utc)
+        )
         results.append(view)
 
-    # Randomly spotlight a small number of matching members without changing filters.
+    # Token-paid profile boosts rank first; the existing small randomized spotlight
+    # continues among search results but can never displace an active paid boost.
     count = min(2, max(1, len(results) // 3)) if len(results) > 1 else 0
     featured_ids = set(random.sample([member["id"] for member in results], count)) if count else set()
     for member in results:
         member["search_featured"] = member["id"] in featured_ids
-    return ([member for member in results if member["search_featured"]] +
-            [member for member in results if not member["search_featured"]])
+    results.sort(key=lambda member: (
+        bool(member.get("_token_featured_rank")), bool(member.get("search_featured"))
+    ), reverse=True)
+    for member in results:
+        member.pop("_token_featured_rank", None)
+    return results
 
 
 @router.get("/crew/{user_id}")
