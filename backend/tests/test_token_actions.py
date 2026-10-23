@@ -365,4 +365,4 @@ def test_free_grant_period_anchor_advances_monthly_without_drifting(monkeypatch)
         for _query, update in users.updates if "token_free_period_start" in update.get("$set", {})
     ]
     assert period_start_updates == [expected_start.isoformat()]
-    assert not any("token_free_period_anchor" in update.get("$set", {}) for _query, update in users.updates)
+    assert any(query.get("token_free_period_anchor") == {"$exists": False} for query, _update in users.updates)
