@@ -79,14 +79,40 @@ async def create_job(
     from token_billing import utc_iso
     token_mode = uses_token_billing(current_user)
     is_emergency = bool(data.is_emergency)
+    action_key = (idempotency_key or "").strip()
+    existing_reservation = None
     job_id = str(uuid.uuid4())
-
+    if token_mode and action_key:
+        if not 8 <= len(action_key) <= 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key must contain 8 to 128 characters.")
+        existing_reservation = await db.token_reservations.find_one(
+            {"user_id": current_user["id"], "idempotency_key": action_key}, {"_id": 0}
+        )
+        if existing_reservation:
+            if (existing_reservation.get("metadata") or {}).get("action_type") != "job_posting":
+                raise HTTPException(status_code=409, detail="Idempotency-Key was used for a different action.")
+            original_job_id = existing_reservation.get("reference_id")
+            if original_job_id:
+                job_id = original_job_id
+                existing_job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
+                if existing_job:
+                    if existing_reservation.get("status") == "reserved":
+                        try:
+                            await __import__("token_billing").TokenWalletService(db).commit_reservation(
+                                current_user["id"], existing_reservation["reservation_id"],
+                                metadata={"action_succeeded": True, "reconciled_from_job": True}
+                            )
+                        except Exception:
+                            raise HTTPException(status_code=503, detail="Job is saved; billing reconciliation is pending.") from None
+                    balance = await __import__("token_billing").TokenWalletService(db).wallet_summary(current_user["id"])
+                    return {**existing_job, "token_balance": balance["balance"], "already_processed": True}
     if token_mode:
+        if not action_key:
+            action_key = f"jobpost:{job_id}"
         _, catalog = await active_catalog()
         cost = int(catalog.token_costs.contractor_post_job)
         if is_emergency:
             cost += int(catalog.token_costs.emergency_job_surcharge)
-        action_key = (idempotency_key or f"jobpost:{job_id}").strip()
         job_doc = {
             "id": job_id, "contractor_id": current_user["id"],
             "contractor_name": current_user.get("company_name") or current_user["name"],
