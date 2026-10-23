@@ -80,6 +80,7 @@ export default function ContractorDashboard() {
   const [verifiedTokenCost, setVerifiedTokenCost] = useState({ standard: 100, pro: 80 });
   const [emergencyTokenCost, setEmergencyTokenCost] = useState(20);
   const jobSubmitIdempotency = useRef(null);
+  const verificationRequestKey = useRef(null);
   const [verifiedLoading, setVerifiedLoading] = useState(false);
   const [pollingVerified, setPollingVerified] = useState(false);
   const [emergencyFee, setEmergencyFee] = useState(2.99);
@@ -279,11 +280,15 @@ export default function ContractorDashboard() {
     setVerifiedLoading(true);
     try {
       if (user?.billing_mode === "tokens_v1") {
-        const key = "verification:" + user.id + ":" + (user.verified_expires_at || "initial");
+        if (!verificationRequestKey.current) {
+          const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          verificationRequestKey.current = `verification:${user.id}:${requestId}`;
+        }
         const res = await axios.post(`${API}/billing/features/verification/renew`, {}, {
-          headers: { "Idempotency-Key": key }
+          headers: { "Idempotency-Key": verificationRequestKey.current }
         });
-        if (setUser) setUser(u => ({ ...u, is_verified_contractor: true, verified_expires_at: res.data.verified_expires_at }));
+        verificationRequestKey.current = null;
+        setUser(u => ({ ...u, is_verified_contractor: true, verified_expires_at: res.data.verified_expires_at }));
         toast.success(`Verification renewed for one year. ${res.data.tokens_charged} tokens charged.`);
         setVerifiedLoading(false);
         return;
@@ -291,7 +296,11 @@ export default function ContractorDashboard() {
       const res = await axios.post(`${API}/payments/verified-contractor/create-session`, { origin_url: window.location.origin });
       window.location.href = res.data.url;
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Could not start checkout");
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        verificationRequestKey.current = null;
+      }
+      toast.error(detail || "Could not start checkout");
       setVerifiedLoading(false);
     }
   };
