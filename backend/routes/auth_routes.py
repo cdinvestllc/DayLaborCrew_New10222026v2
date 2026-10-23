@@ -48,7 +48,7 @@ async def _grant_initial_token_allowances(user: dict) -> None:
     trial_expiry = datetime.fromisoformat(user["token_trial_end_at"])
     try:
         amount = int(catalog.token_policy.welcome_tokens)
-        if amount > 0:
+        if user.get("is_verified") is True and amount > 0:
             await wallet.grant_tokens(
                 uid, amount, idempotency_key=f"welcome:{uid}:token-v1",
                 reason="One-time starter token grant", source="welcome_grant",
