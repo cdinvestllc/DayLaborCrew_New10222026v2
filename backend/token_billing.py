@@ -6,9 +6,10 @@ transaction; the deployment must use a transaction-capable replica set (Atlas qu
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Literal
 import uuid
+import hashlib
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pymongo.errors import DuplicateKeyError
@@ -242,6 +243,10 @@ class TokenWalletService:
         await self.db.token_lots.create_index([("user_id", 1), ("expires_at", 1), ("remaining", 1)])
         await self.db.token_ledger.create_index([("user_id", 1), ("idempotency_key", 1)], unique=True)
         await self.db.token_ledger.create_index([("user_id", 1), ("created_at", -1)])
+        await self.db.token_reservations.create_index(
+            [("user_id", 1), ("idempotency_key", 1)], unique=True
+        )
+        await self.db.token_reservations.create_index([("user_id", 1), ("status", 1), ("expires_at", 1)])
         self._indexes_ready = True
 
     async def _transaction(self, callback):
@@ -474,6 +479,283 @@ class TokenWalletService:
             if result:
                 return result
             raise IdempotencyConflict("Token operation conflicted with another write; retry with a fresh key.") from None
+
+    @staticmethod
+    def _reservation_id(user_id: str, idempotency_key: str) -> str:
+        material = f"{user_id}:{idempotency_key}".encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
+
+    async def reserve_tokens(
+        self, user_id: str, amount: int, *, idempotency_key: str, reason: str,
+        metadata: dict[str, Any] | None = None, reference_id: str | None = None,
+        reservation_ttl_seconds: int = 900
+    ) -> dict[str, Any]:
+        """Atomically remove spendable tokens while an action is attempted.
+
+        Commit keeps the reservation debited. Release restores only lots that remain
+        unexpired. Repeating the same request key returns the existing reservation.
+        """
+        self._validate_operation(user_id, amount, idempotency_key, reason)
+        if isinstance(reservation_ttl_seconds, bool) or not isinstance(reservation_ttl_seconds, int) or not 30 <= reservation_ttl_seconds <= 3600:
+            raise ValueError("Reservation TTL must be between 30 and 3600 seconds")
+        metadata = metadata or {}
+        await self.ensure_indexes()
+        reservation_id = self._reservation_id(user_id, idempotency_key)
+
+        async def lookup_existing():
+            existing = await self.db.token_reservations.find_one(
+                {"user_id": user_id, "idempotency_key": idempotency_key}, {"_id": 0}
+            )
+            if not existing:
+                return None
+            if (
+                int(existing.get("amount", 0)) != amount or existing.get("reason") != reason
+                or existing.get("metadata", {}) != metadata or existing.get("reference_id") != reference_id
+            ):
+                raise IdempotencyConflict("This reservation key was already used for a different token action.")
+            if existing.get("status") == "released":
+                raise IdempotencyConflict("This token reservation was already released; use a new request key.")
+            summary = await self.wallet_summary(user_id)
+            return {
+                "reservation_id": existing["reservation_id"], "status": existing["status"],
+                "balance": summary["balance"], "already_processed": True,
+                "allocations": existing.get("allocations", [])
+            }
+
+        existing = await lookup_existing()
+        if existing:
+            return existing
+        now_text = utc_iso()
+        expiry_text = utc_iso(utc_now() + timedelta(seconds=reservation_ttl_seconds))
+        reservation = {
+            "_id": reservation_id, "reservation_id": reservation_id,
+            "user_id": user_id, "idempotency_key": idempotency_key,
+            "amount": amount, "reason": reason, "metadata": metadata,
+            "reference_id": reference_id, "status": "reserved",
+            "created_at": now_text, "updated_at": now_text, "expires_at": expiry_text
+        }
+        entry_id = str(uuid.uuid4())
+
+        async def operation(session):
+            found = await self.db.token_reservations.find_one(
+                {"user_id": user_id, "idempotency_key": idempotency_key}, session=session
+            )
+            if found:
+                if (
+                    int(found.get("amount", 0)) != amount or found.get("reason") != reason
+                    or found.get("metadata", {}) != metadata or found.get("reference_id") != reference_id
+                ):
+                    raise IdempotencyConflict("This reservation key was already used for a different token action.")
+                if found.get("status") == "released":
+                    raise IdempotencyConflict("This token reservation was already released; use a new request key.")
+                wallet_doc = await self.db.token_wallets.find_one({"_id": user_id}, session=session) or {}
+                return {
+                    "reservation_id": found["reservation_id"], "status": found["status"],
+                    "balance": int(wallet_doc.get("balance", 0)), "already_processed": True,
+                    "allocations": found.get("allocations", [])
+                }
+            now = utc_now()
+            await self._expire_in_session(session, user_id, now)
+            wallet_doc = await self.db.token_wallets.find_one({"_id": user_id}, session=session)
+            balance = int((wallet_doc or {}).get("balance", 0))
+            if balance < amount:
+                raise InsufficientTokens("Not enough unexpired tokens")
+            cursor = self.db.token_lots.find(
+                {"user_id": user_id, "remaining": {"$gt": 0}, "expires_at": {"$gt": utc_iso(now)}},
+                session=session
+            ).sort([("expires_at", 1), ("created_at", 1), ("lot_id", 1)])
+            lots = await cursor.to_list(length=None)
+            allocations = allocate_lots(lots, amount)
+            for allocation in allocations:
+                lot = next(
+                    item for item in lots
+                    if (item.get("lot_id") or str(item.get("_id", ""))) == allocation["lot_id"]
+                )
+                previous = int(lot["remaining"])
+                result = await self.db.token_lots.update_one(
+                    {"_id": lot["_id"], "remaining": previous},
+                    {"$inc": {"remaining": -allocation["amount"]}, "$set": {"updated_at": now_text}},
+                    session=session
+                )
+                if result.modified_count != 1:
+                    raise TokenStoreUnavailable("Token lots changed while reserving; retry the action.")
+            result = await self.db.token_wallets.update_one(
+                {"_id": user_id, "balance": {"$gte": amount}},
+                {"$inc": {"balance": -amount}, "$set": {"updated_at": now_text}},
+                session=session
+            )
+            if result.modified_count != 1:
+                raise TokenStoreUnavailable("Token wallet changed while reserving; retry the action.")
+            reservation["allocations"] = allocations
+            await self.db.token_reservations.insert_one(reservation, session=session)
+            await self.db.token_ledger.insert_one({
+                "entry_id": entry_id, "user_id": user_id,
+                "idempotency_key": f"reserve:{reservation_id}", "operation": "reserve",
+                "delta": -amount, "amount": amount, "reason": reason,
+                "source": "reservation", "reference_id": reference_id,
+                "reservation_id": reservation_id, "allocations": allocations,
+                "metadata": metadata, "created_at": now_text
+            }, session=session)
+            return {
+                "reservation_id": reservation_id, "status": "reserved",
+                "balance": balance - amount, "already_processed": False,
+                "allocations": allocations
+            }
+
+        try:
+            return await self._transaction(operation)
+        except DuplicateKeyError:
+            result = await lookup_existing()
+            if result:
+                return result
+            raise IdempotencyConflict("Token reservation conflicted with another request; retry with a fresh key.") from None
+
+    async def commit_reservation(
+        self, user_id: str, reservation_id: str, *, metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Commit a reserved debit after the protected business action succeeds."""
+        metadata = metadata or {}
+        if not user_id or not reservation_id:
+            raise ValueError("User and reservation are required")
+        await self.ensure_indexes()
+        entry_id = str(uuid.uuid4())
+        now_text = utc_iso()
+
+        async def operation(session):
+            reservation = await self.db.token_reservations.find_one(
+                {"_id": reservation_id, "user_id": user_id}, session=session
+            )
+            if not reservation:
+                raise IdempotencyConflict("Token reservation was not found for this user.")
+            status = reservation.get("status")
+            if status == "committed":
+                wallet_doc = await self.db.token_wallets.find_one({"_id": user_id}, session=session) or {}
+                return {"reservation_id": reservation_id, "status": status,
+                        "balance": int(wallet_doc.get("balance", 0)), "already_processed": True}
+            if status != "reserved":
+                raise IdempotencyConflict("Only an active token reservation can be committed.")
+            now = utc_now()
+            updated = await self.db.token_reservations.update_one(
+                {"_id": reservation_id, "user_id": user_id, "status": "reserved"},
+                {"$set": {"status": "committed", "committed_at": utc_iso(now),
+                          "updated_at": utc_iso(now), "commit_metadata": metadata}},
+                session=session
+            )
+            if updated.modified_count != 1:
+                raise IdempotencyConflict("Token reservation changed concurrently; retry the action.")
+            await self.db.token_ledger.insert_one({
+                "entry_id": entry_id, "user_id": user_id,
+                "idempotency_key": f"commit:{reservation_id}", "operation": "commit",
+                "delta": 0, "amount": int(reservation["amount"]), "reason": reservation["reason"],
+                "source": "reservation_commit", "reference_id": reservation.get("reference_id"),
+                "reservation_id": reservation_id, "metadata": metadata, "created_at": utc_iso(now)
+            }, session=session)
+            wallet_doc = await self.db.token_wallets.find_one({"_id": user_id}, session=session) or {}
+            return {"reservation_id": reservation_id, "status": "committed",
+                    "balance": int(wallet_doc.get("balance", 0)), "already_processed": False}
+
+        return await self._transaction(operation)
+
+    async def release_reservation(
+        self, user_id: str, reservation_id: str, *, reason: str = "Business action failed",
+        metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Release an active reservation, restoring only token lots that have not expired."""
+        if not user_id or not reservation_id:
+            raise ValueError("User and reservation are required")
+        if not isinstance(reason, str) or not 3 <= len(reason.strip()) <= 300:
+            raise ValueError("A reason between 3 and 300 characters is required")
+        metadata = metadata or {}
+        await self.ensure_indexes()
+        entry_id = str(uuid.uuid4())
+
+        async def operation(session):
+            reservation = await self.db.token_reservations.find_one(
+                {"_id": reservation_id, "user_id": user_id}, session=session
+            )
+            if not reservation:
+                raise IdempotencyConflict("Token reservation was not found for this user.")
+            status = reservation.get("status")
+            if status == "released":
+                wallet_doc = await self.db.token_wallets.find_one({"_id": user_id}, session=session) or {}
+                return {"reservation_id": reservation_id, "status": status,
+                        "balance": int(wallet_doc.get("balance", 0)), "already_processed": True}
+            if status != "reserved":
+                raise IdempotencyConflict("Only an active token reservation can be released.")
+            now = utc_now()
+            now_text = utc_iso(now)
+            restored = 0
+            for allocation in reservation.get("allocations", []):
+                lot_id = allocation.get("lot_id")
+                amount = int(allocation.get("amount", 0))
+                lot = await self.db.token_lots.find_one(
+                    {"_id": lot_id, "user_id": user_id}, {"_id": 0, "expires_at": 1}
+                )
+                if not lot or not lot.get("expires_at") or lot["expires_at"] <= now_text:
+                    continue
+                result = await self.db.token_lots.update_one(
+                    {"_id": lot_id, "user_id": user_id, "expires_at": {"$gt": now_text}},
+                    {"$inc": {"remaining": amount}, "$set": {"updated_at": now_text}},
+                    session=session
+                )
+                if result.modified_count == 1:
+                    restored += amount
+            wallet_doc = await self.db.token_wallets.find_one({"_id": user_id}, session=session) or {}
+            if restored:
+                result = await self.db.token_wallets.update_one(
+                    {"_id": user_id},
+                    {"$inc": {"balance": restored}, "$set": {"updated_at": now_text}},
+                    session=session
+                )
+                if result.modified_count != 1:
+                    raise TokenStoreUnavailable("Token wallet changed while releasing; retry the action.")
+            result = await self.db.token_reservations.update_one(
+                {"_id": reservation_id, "user_id": user_id, "status": "reserved"},
+                {"$set": {"status": "released", "release_reason": reason,
+                          "released_at": now_text, "updated_at": now_text,
+                          "released_amount": restored, "release_metadata": metadata}},
+                session=session
+            )
+            if result.modified_count != 1:
+                raise IdempotencyConflict("Token reservation changed concurrently; retry the action.")
+            await self.db.token_ledger.insert_one({
+                "entry_id": entry_id, "user_id": user_id,
+                "idempotency_key": f"release:{reservation_id}", "operation": "release",
+                "delta": restored, "amount": int(reservation["amount"]), "reason": reason,
+                "source": "reservation_release", "reference_id": reservation.get("reference_id"),
+                "reservation_id": reservation_id, "metadata": metadata,
+                "expired_while_reserved": int(reservation["amount"]) - restored,
+                "created_at": now_text
+            }, session=session)
+            return {"reservation_id": reservation_id, "status": "released",
+                    "balance": int(wallet_doc.get("balance", 0)) + restored, "restored": restored,
+                    "already_processed": False}
+
+        return await self._transaction(operation)
+
+    async def release_expired_reservations(self, limit: int = 200) -> dict[str, int]:
+        """Recover reservations abandoned by a process crash after the action timeout."""
+        await self.ensure_indexes()
+        now_text = utc_iso()
+        cursor = self.db.token_reservations.find(
+            {"status": "reserved", "expires_at": {"$lte": now_text}},
+            {"_id": 0, "reservation_id": 1, "user_id": 1}
+        ).sort("expires_at", 1).limit(max(1, min(int(limit), 500)))
+        due = await cursor.to_list(length=max(1, min(int(limit), 500)))
+        released = 0
+        restored = 0
+        for reservation in due:
+            try:
+                result = await self.release_reservation(
+                    reservation["user_id"], reservation["reservation_id"],
+                    reason="Reservation timed out before action completion", metadata={"automatic": True}
+                )
+                if not result.get("already_processed"):
+                    released += 1
+                    restored += int(result.get("restored", 0))
+            except (IdempotencyConflict, TokenStoreUnavailable):
+                continue
+        return {"reservations_checked": len(due), "reservations_released": released, "tokens_restored": restored}
 
     async def wallet_summary(self, user_id: str) -> dict[str, Any]:
         await self.ensure_indexes()
