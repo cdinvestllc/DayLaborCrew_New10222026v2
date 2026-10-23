@@ -161,8 +161,32 @@ async def execute_token_action(
         try:
             result = await action(reserved["reservation_id"])
         except Exception:
-            # Action failed before this function received a success result; refund remains
-            # idempotent and will only restore lots which have not expired.
+            # A database write can succeed even when its client loses the acknowledgment.
+            # Check for the durable business marker before releasing the reservation.
+            try:
+                persisted = await _action_persisted(user["id"], reserved["reservation_id"], reference_id, metadata)
+            except Exception:
+                # Status cannot be proven, so hold the reservation for maintenance instead
+                # of risking a free action by refunding tokens after an ambiguous write.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Action status could not be confirmed. The token reservation is held for reconciliation; retry with the same Idempotency-Key."
+                ) from None
+            if persisted:
+                try:
+                    committed = await wallet.commit_reservation(
+                        user["id"], reserved["reservation_id"],
+                        metadata={"action_succeeded": True, "reconciled_after_action_error": True,
+                                  "action": metadata or {}}
+                    )
+                except Exception:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="The action was saved, but its token charge is still being reconciled. Retry with the same Idempotency-Key."
+                    ) from None
+                return {"already_processed": True, "balance": committed["balance"], "result": None,
+                        "reservation_id": reserved["reservation_id"]}
+            # No durable business record exists, so it is safe to restore the reservation.
             try:
                 await wallet.release_reservation(
                     user["id"], reserved["reservation_id"], reason=f"{reason}: action failed",
