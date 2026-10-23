@@ -60,7 +60,10 @@ async def build_user_view(target: dict, viewer: dict | None, include_coords: boo
             if expiry.tzinfo is None:
                 expiry = expiry.replace(tzinfo=timezone.utc)
             if expiry > now:
-                videos.append(video)
+                videos.append({
+                    key: video[key] for key in ("id", "url", "duration_seconds", "created_at", "expires_at")
+                    if key in video
+                })
         except (TypeError, ValueError):
             continue
     view["portfolio_videos"] = videos
