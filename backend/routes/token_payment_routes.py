@@ -360,7 +360,7 @@ async def _grant_subscription_period(
     patch = {
         "last_paid_reference": provider_reference,
         "last_granted_period": period_label,
-        "current_period_start": utc_iso(period_start),
+        "current_period_start": (sub.get("current_period_start") or utc_iso(period_start)) if sub.get("billing_interval") == "year" else utc_iso(period_start),
         "current_period_end": utc_iso(period_end),
         "next_token_grant_at": next_grant_at,
         "next_grant_index": next_grant_index,
