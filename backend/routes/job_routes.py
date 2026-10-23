@@ -418,7 +418,17 @@ async def accept_job(
                             if item.get("crew_id") == current_user["id"]), None)
             if receipt:
                 from token_billing import TokenWalletService
-                summary = await TokenWalletService(db).wallet_summary(current_user["id"])
+                wallet_service = TokenWalletService(db)
+                saved_reservation = await db.token_reservations.find_one(
+                    {"reservation_id": receipt.get("reservation_id"), "user_id": current_user["id"]},
+                    {"_id": 0, "status": 1, "reservation_id": 1}
+                ) if receipt.get("reservation_id") else None
+                if saved_reservation and saved_reservation.get("status") == "reserved":
+                    await wallet_service.commit_reservation(
+                        current_user["id"], saved_reservation["reservation_id"],
+                        metadata={"action_succeeded": True, "recovered_from_duplicate_accept": True}
+                    )
+                summary = await wallet_service.wallet_summary(current_user["id"])
                 await record_qualifying_activity(
                     current_user["id"], "job_application", f"apply:{job_id}:{current_user['id']}",
                     metadata={"job_id": job_id}
