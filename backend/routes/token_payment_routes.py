@@ -1060,9 +1060,10 @@ async def handle_paypal_event(event_value: Any) -> bool:
                 period_end = period_end.replace(tzinfo=timezone.utc)
         except ValueError:
             period_end = _add_months_anchored(sale_time, 1 if sub["billing_interval"] == "month" else 12)
-        # PayPal sale IDs are stable across redelivery. The month label prevents two event
-        # variants of the same subscription period from creating a second monthly allowance.
-        start_period = datetime(sale_time.year, sale_time.month, 1, tzinfo=timezone.utc)
+        # PayPal sale IDs and create_time are stable across redelivery. Use the actual
+        # paid timestamp as the expiry anchor (not the first day of the month), while the
+        # subscription-period ledger key remains month-based and idempotent.
+        start_period = sale_time.astimezone(timezone.utc)
         if sub["billing_interval"] == "year":
             sub["current_period_start"] = utc_iso(sale_time)
             sub["next_grant_index"] = 1
