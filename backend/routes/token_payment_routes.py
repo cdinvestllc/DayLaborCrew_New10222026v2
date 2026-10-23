@@ -352,8 +352,11 @@ async def _grant_subscription_period(
         next_grant_index = int(sub.get("next_grant_index", 1))
         candidate = _add_months_anchored(anchor, next_grant_index)
         if candidate < period_end:
+            # The cursor denotes the month currently scheduled; the scheduler increments
+            # it only after successfully releasing that month's allowance.
             next_grant_at = utc_iso(candidate)
-            next_grant_index += 1
+        else:
+            next_grant_index = None
     patch = {
         "last_paid_reference": provider_reference,
         "last_granted_period": period_label,
@@ -444,14 +447,14 @@ async def _process_stripe_invoice(invoice_value: Any, subscription_value: Any = 
         {"_id": sub["id"], "provider_subscription_id": {"$in": [None, subscription_id]}},
         {"$set": {
             "provider_subscription_id": subscription_id,
-            "current_period_start": sub.get("current_period_start") or utc_iso(period_start),
+            "current_period_start": utc_iso(period_start),
             "current_period_end": utc_iso(period_end), "updated_at": utc_iso()
         }}
     )
     if sub.get("billing_interval") == "year":
-        # One grant is minted now; a protected scheduled runner releases the remaining
-        # monthly allowances. Ledger idempotency protects concurrent runner/webhook retries.
-        sub["current_period_start"] = sub.get("current_period_start") or utc_iso(period_start)
+        # Reset the anchor and the next-month cursor for each paid annual cycle.
+        # The initial grant is recorded now; the scheduler starts at index 1 (one month later).
+        sub["current_period_start"] = utc_iso(period_start)
         sub["next_grant_index"] = 1
     result = await _grant_subscription_period(
         sub, period_start=period_start, period_end=period_end,
