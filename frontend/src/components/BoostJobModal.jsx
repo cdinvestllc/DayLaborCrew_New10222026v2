@@ -78,7 +78,7 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
             </div>
             <div>
               <h2 className="font-extrabold text-[#050A30] dark:text-white text-lg" style={{ fontFamily: "Manrope, sans-serif" }}>Boost This Job</h2>
-              <p className="text-xs text-slate-400">One-time payment — no subscription required</p>
+              <p className="text-xs text-slate-400">{tokenMode ? "Token wallet payment" : "One-time payment — no subscription required"}</p>
             </div>
           </div>
           <button onClick={onClose} className="p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg">
@@ -145,7 +145,7 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
               Pay with PayPal
             </button>
           </div>
-        ) : (
+        ) : !tokenMode ? (
           <div className="space-y-3">
             <div className="flex items-center gap-2 mb-1">
               <button onClick={() => setMethod(null)} className="text-xs text-slate-400 hover:text-slate-600">← Back</button>
