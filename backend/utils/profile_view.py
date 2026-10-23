@@ -4,7 +4,7 @@ from utils.geocoding import valid_coords
 
 PUBLIC_FIELDS = (
     "id", "name", "role", "bio", "trade", "skills", "rating", "rating_count", "jobs_completed",
-    "availability", "portfolio", "company_name", "created_at", "profile_photo", "logo",
+    "availability", "portfolio", "portfolio_videos", "company_name", "created_at", "profile_photo", "logo",
     "transportation", "certifications", "is_verified_contractor", "verified_contractor_at", "is_insured",
 )
 STAFF_ROLES = ("admin", "super_admin")
