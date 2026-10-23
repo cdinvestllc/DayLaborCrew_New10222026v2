@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import secrets
@@ -124,8 +123,15 @@ async def token_boost_job(
         action=action, reference_id=job_id,
         metadata={"action_type": "job_boost", "job_id": job_id, "feature": "contractor_job_boost"}
     )
-    return {"status": "boosted", "tokens_charged": cost, "balance": result["balance"],
-            "already_processed": result["already_processed"], **(result["result"] or {})}
+    payload = result.get("result") or {}
+    if not payload:
+        saved_job = await db.jobs.find_one(
+            {"id": job_id, "token_boost_reservation_id": result.get("reservation_id")},
+            {"_id": 0, "boost_expires_at": 1}
+        )
+        payload = {"job_id": job_id, "boost_expires_at": (saved_job or {}).get("boost_expires_at")}
+    return {"status": "boosted", "tokens_charged": 0 if result["already_processed"] else cost,
+            "balance": result["balance"], "already_processed": result["already_processed"], **payload}
 
 
 @router.post("/profile/boost")
@@ -167,8 +173,15 @@ async def token_boost_profile(
         action=action, reference_id=current_user["id"],
         metadata={"action_type": "profile_boost", "feature": "crew_profile_boost"}
     )
-    return {"status": "boosted", "tokens_charged": cost, "balance": result["balance"],
-            "already_processed": result["already_processed"], **(result["result"] or {})}
+    payload = result.get("result") or {}
+    if not payload:
+        saved_user = await db.users.find_one(
+            {"id": current_user["id"], "profile_boost_reservation_id": result.get("reservation_id")},
+            {"_id": 0, "profile_boost_expires_at": 1}
+        )
+        payload = {"profile_boost_expires_at": (saved_user or {}).get("profile_boost_expires_at")}
+    return {"status": "boosted", "tokens_charged": 0 if result["already_processed"] else cost,
+            "balance": result["balance"], "already_processed": result["already_processed"], **payload}
 
 
 @router.post("/verification/renew")
@@ -219,9 +232,16 @@ async def token_verified_contractor_renewal(
         action=action, reference_id=current_user["id"],
         metadata={"action_type": "verification_renewal", "feature": "verified_contractor_renewal"}
     )
-    return {"status": "verified", "tokens_charged": cost, "pro_discount_applied": pro,
-            "balance": result["balance"], "already_processed": result["already_processed"],
-            **(result["result"] or {})}
+    payload = result.get("result") or {}
+    if not payload:
+        saved_user = await db.users.find_one(
+            {"id": current_user["id"], "verification_token_reservation_id": result.get("reservation_id")},
+            {"_id": 0, "verified_expires_at": 1}
+        )
+        payload = {"verified_expires_at": (saved_user or {}).get("verified_expires_at")}
+    return {"status": "verified", "tokens_charged": 0 if result["already_processed"] else cost,
+            "pro_discount_applied": pro, "balance": result["balance"],
+            "already_processed": result["already_processed"], **payload}
 
 
 @router.post("/portfolio/video")
@@ -242,11 +262,19 @@ async def upload_portfolio_video(
         raise HTTPException(status_code=400, detail="Upload a valid MP4 or WebM video.")
     duration = await asyncio.to_thread(_verify_video_duration, data)
     await file.seek(0)
-    video_id = str(uuid.uuid4())
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Idempotency-Key is required for video uploads.")
+    key = _request_key(idempotency_key, "")
+    # Same request key means the same video record across retries, even if the first response was lost.
+    video_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"daylaborcrew:{current_user['id']}:{key}"))
     cost = int(catalog.token_costs.video_30_seconds_30_days)
-    key = _request_key(idempotency_key, f"portfoliovideo:{current_user['id']}:{video_id}")
 
     async def action(reservation_id: str):
+        current = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "portfolio_videos": 1})
+        if not current:
+            raise HTTPException(status_code=404, detail="User not found.")
+        if len(current.get("portfolio_videos") or []) >= MAX_PROFILE_VIDEOS:
+            raise HTTPException(status_code=400, detail=f"Maximum {MAX_PROFILE_VIDEOS} portfolio videos allowed.")
         await file.seek(0)
         url = await save_video(file, current_user["id"], "portfolio_videos")
         now = utc_now()
@@ -255,14 +283,20 @@ async def upload_portfolio_video(
             "created_at": utc_iso(now), "expires_at": utc_iso(now + timedelta(days=30)),
             "reservation_id": reservation_id, "billing_source": "tokens"
         }
-        current = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "portfolio_videos": 1})
-        if not current:
-            raise HTTPException(status_code=404, detail="User not found.")
-        if len(current.get("portfolio_videos") or []) >= MAX_PROFILE_VIDEOS:
-            raise HTTPException(status_code=400, detail=f"Maximum {MAX_PROFILE_VIDEOS} portfolio videos allowed.")
-        await db.users.update_one(
-            {"id": current_user["id"]}, {"$push": {"portfolio_videos": record}}
+        update = await db.users.update_one(
+            {"id": current_user["id"],
+             "$expr": {"$lt": [{"$size": {"$ifNull": ["$portfolio_videos", []]}}, MAX_PROFILE_VIDEOS]},
+             "portfolio_videos.id": {"$ne": video_id}},
+            {"$push": {"portfolio_videos": record}}
         )
+        if update.modified_count != 1:
+            # The object is no longer referenced if another upload won the final slot.
+            storage_path = url.removeprefix("/api/public/files/")
+            await db.files.update_one(
+                {"storage_path": storage_path},
+                {"$set": {"is_deleted": True, "deleted_at": utc_iso()}}
+            )
+            raise HTTPException(status_code=409, detail="Portfolio changed during upload; refresh and retry.")
         return {"video": record}
 
     result = await execute_token_action(
@@ -270,5 +304,13 @@ async def upload_portfolio_video(
         action=action, reference_id=video_id,
         metadata={"action_type": "portfolio_video", "feature": "video_30_seconds_30_days", "video_id": video_id}
     )
-    return {"status": "uploaded", "tokens_charged": cost, "balance": result["balance"],
-            "already_processed": result["already_processed"], **(result["result"] or {})}
+    payload = result.get("result") or {}
+    if not payload:
+        saved_user = await db.users.find_one(
+            {"id": current_user["id"], "portfolio_videos": {"$elemMatch": {"reservation_id": result.get("reservation_id")}}},
+            {"_id": 0, "portfolio_videos": 1}
+        )
+        payload = {"video": next((v for v in (saved_user or {}).get("portfolio_videos", [])
+                                  if v.get("reservation_id") == result.get("reservation_id")), None)}
+    return {"status": "uploaded", "tokens_charged": 0 if result["already_processed"] else cost,
+            "balance": result["balance"], "already_processed": result["already_processed"], **payload}
