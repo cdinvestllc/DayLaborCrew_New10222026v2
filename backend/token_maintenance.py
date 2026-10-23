@@ -175,6 +175,7 @@ async def _classify_legacy_users(limit: int) -> dict[str, int]:
             "billing_plan": ("trial_crew" if user["role"] == "crew" else "trial_contractor") if trial_end else ("free_crew" if user["role"] == "crew" else "free_contractor"),
             "billing_subscription_status": "trial" if trial_end else "free",
             "token_free_period_start": utc_iso(now),
+            "token_free_period_anchor": utc_iso(now),
             "token_welcome_expiry_at": utc_iso(welcome_expiry),
             "token_billing_migration_v1": True,
             "token_billing_migrated_at": utc_iso(now)
@@ -213,6 +214,7 @@ async def _cut_over_expired_legacy_users(limit: int) -> int:
                 "billing_plan": "free_crew" if user["role"] == "crew" else "free_contractor",
                 "billing_subscription_status": "free",
                 "token_free_period_start": now_text,
+                "token_free_period_anchor": now_text,
                 "token_welcome_expiry_at": expiry,
                 "legacy_token_cutover_completed_at": now_text
             }}
@@ -369,7 +371,7 @@ async def _issue_qualified_free_grants(limit: int) -> dict[str, int]:
         {"role": {"$in": ["crew", "contractor"]}, "billing_mode": "tokens_v1", "is_verified": True,
          "billing_subscription_status": {"$in": ["free", None]},
          "billing_plan": {"$in": ["free_crew", "free_contractor"]}},
-        {"_id": 0, "id": 1, "role": 1, "created_at": 1, "token_free_period_start": 1,
+        {"_id": 0, "id": 1, "role": 1, "created_at": 1, "token_free_period_start": 1, "token_free_period_anchor": 1,
          "last_free_token_grant_period": 1}
     ).limit(max(1, min(limit, 1000)))
     users = await cursor.to_list(length=max(1, min(limit, 1000)))
@@ -379,13 +381,19 @@ async def _issue_qualified_free_grants(limit: int) -> dict[str, int]:
         uid = user.get("id")
         if not uid:
             continue
-        period_start = _dt(user.get("token_free_period_start")) or _dt(user.get("created_at")) or now
+        period_anchor = _dt(user.get("token_free_period_anchor")) or _dt(user.get("created_at")) or now
+        period_start = period_anchor
         if period_start > now:
             period_start = now
         elapsed = max(0, int((now - period_start).total_seconds() // (period_days * 86400)))
         current_start = period_start + timedelta(days=elapsed * period_days)
         current_end = current_start + timedelta(days=period_days)
         current_start_text = utc_iso(current_start)
+        # Keep the anchor immutable; only the display/current period start advances.
+        await db.users.update_one(
+            {"id": uid, "token_free_period_anchor": {"$exists": False}},
+            {"$set": {"token_free_period_anchor": utc_iso(period_anchor)}}
+        )
         if user.get("token_free_period_start") != current_start_text:
             await db.users.update_one({"id": uid}, {"$set": {"token_free_period_start": current_start_text}})
         if user.get("last_free_token_grant_period") == current_start_text:
