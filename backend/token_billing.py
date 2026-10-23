@@ -131,6 +131,9 @@ class TokenPolicyConfig(StrictModel):
     trial_tokens_expire_at: Literal["trial_end"]
     trial_crew_tokens: int = Field(ge=0, le=1_000_000)
     trial_contractor_tokens: int = Field(ge=0, le=1_000_000)
+    # Defaults preserve validation for catalogs stored before the welcome-grant setting existed.
+    welcome_tokens: int = Field(default=10, ge=0, le=1_000_000)
+    welcome_grant_expiry_days: int = Field(default=30, ge=1, le=3650)
     active_free_tasks_required: int = Field(ge=0, le=1000)
     active_free_period_days: int = Field(ge=1, le=3650)
     qualifying_activities: list[str] = Field(min_length=1, max_length=30)
