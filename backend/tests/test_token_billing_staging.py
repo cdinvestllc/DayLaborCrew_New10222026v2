@@ -90,8 +90,8 @@ def test_staging_guard_and_provider_variables_are_present():
     assert os.environ.get("PAYPAL_CLIENT_ID")
     assert os.environ.get("PAYPAL_SECRET")
     assert os.environ.get("PAYPAL_WEBHOOK_ID")
-    assert api_host and web_host and "staging" in db_name.lower() or any(
-        marker in db_name.lower() for marker in ("stage", "stg", "test")
+    assert api_host and web_host and any(
+        marker in db_name.lower() for marker in ("staging", "stage", "stg", "test")
     )
 
 
