@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { X, Zap, CreditCard, DollarSign, CheckCircle, ExternalLink } from "lucide-react";
 import axios from "axios";
 import { toast } from "sonner";
@@ -14,6 +14,7 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
   const [method, setMethod] = useState(null); // "stripe" | "paypal"
   const [loading, setLoading] = useState(false);
   const [tokenCost, setTokenCost] = useState(10);
+  const tokenBoostRequestKey = useRef(null);
 
   useEffect(() => {
     if (!tokenMode) return;
@@ -25,14 +26,22 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
   const handleTokenBoost = async () => {
     setLoading(true);
     try {
-      const key = `jobboost:${job.id}:${job.boost_expires_at || "initial"}`;
+      if (!tokenBoostRequestKey.current) {
+        const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        tokenBoostRequestKey.current = `jobboost:${job.id}:${requestId}`;
+      }
       const res = await axios.post(`${API}/billing/features/jobs/${job.id}/boost`, {}, {
-        headers: { "Idempotency-Key": key }
+        headers: { "Idempotency-Key": tokenBoostRequestKey.current }
       });
+      tokenBoostRequestKey.current = null;
       toast.success(`Job boosted for ${BOOST_DAYS} days. ${res.data.tokens_charged || tokenCost} tokens charged.`);
       onSuccess?.();
     } catch (err) {
-      toast.error(err?.response?.data?.detail || "Could not boost job with tokens");
+      const detail = err?.response?.data?.detail || "";
+      if (err?.response && !(err.response.status === 409 && String(detail).includes("already processing"))) {
+        tokenBoostRequestKey.current = null;
+      }
+      toast.error(detail || "Could not boost job with tokens");
     } finally {
       setLoading(false);
     }
