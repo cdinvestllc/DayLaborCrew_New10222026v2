@@ -737,14 +737,27 @@ async def stripe_webhook(request: Request):
     event = _verify_stripe_event(
         body, request.headers.get("Stripe-Signature", ""), STRIPE_WEBHOOK_SECRET)
     event_type = event.get("type")
-    if event_type not in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+    supported = {
+        "checkout.session.completed", "checkout.session.async_payment_succeeded",
+        "invoice.paid", "customer.subscription.deleted",
+    }
+    if event_type not in supported:
         return {"status": "ignored"}
-    session = event.get("data", {}).get("object") or {}
-    if session.get("object") != "checkout.session" or session.get("payment_status") != "paid":
-        return {"status": "ignored"}
+    obj = (event.get("data", {}).get("object") or {})
     try:
         _stripe_api_key()  # Enforce test/live key-mode consistency for webhook deployments too.
-        await _fulfill_stripe_checkout_session(session)
+        if event_type in {"invoice.paid", "customer.subscription.deleted"}:
+            from routes.token_payment_routes import handle_stripe_event
+            handled = await handle_stripe_event(event)
+            return {"status": "ok" if handled else "ignored"}
+        metadata = obj.get("metadata") or {}
+        if metadata.get("billing_system") == "token_wallet_v1":
+            from routes.token_payment_routes import handle_stripe_event
+            await handle_stripe_event(event)
+            return {"status": "ok"}
+        if obj.get("object") != "checkout.session" or obj.get("payment_status") != "paid":
+            return {"status": "ignored"}
+        await _fulfill_stripe_checkout_session(obj)
     except HTTPException:
         raise
     except Exception as exc:
@@ -764,6 +777,16 @@ async def paypal_webhook(request: Request):
     if not isinstance(event, dict):
         raise HTTPException(status_code=400, detail="Invalid PayPal webhook payload")
     await _verify_paypal_webhook(request, event)
+    try:
+        from routes.token_payment_routes import handle_paypal_event
+        if await handle_paypal_event(event):
+            return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("PayPal token billing webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Payment event could not be processed; retry delivery") from None
+
     if event.get("event_type") != "PAYMENT.CAPTURE.COMPLETED":
         return {"status": "ignored"}
 
@@ -784,7 +807,7 @@ async def paypal_webhook(request: Request):
         logger.error("PayPal capture did not match its recorded provider, amount, or currency")
         return {"status": "rejected"}
     if tx.get("plan") in PLANS:
-        await fulfill_subscription_tx(order_id)
+        await fulfill_subscription_tx(order_id, expected_provider="paypal")
     elif tx.get("plan") == "boost":
         await _fulfill_boost_tx(order_id)
     else:
