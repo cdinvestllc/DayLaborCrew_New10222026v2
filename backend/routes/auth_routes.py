@@ -393,7 +393,8 @@ async def google_oauth_callback(request: Request, response: Response):
             "billing_subscription_status": "trial",
             "token_trial_started_at": now,
             "token_trial_end_at": token_trial_end_at,
-            "token_free_period_start": token_trial_end_at,
+            "token_free_period_start": now,
+            "token_free_period_anchor": now,
             "token_welcome_expiry_at": token_welcome_expiry_at,
         }
         await db.users.insert_one(user)
