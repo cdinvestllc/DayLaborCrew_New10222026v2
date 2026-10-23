@@ -130,6 +130,25 @@ def test_execute_token_action_recovers_persisted_action_without_replaying_it(mon
     assert result["reservation_id"] == "reservation-recovered"
 
 
+def test_execute_token_action_commits_if_action_raised_after_durable_write(monkeypatch):
+    import token_actions
+    fake = FakeWallet()
+    monkeypatch.setattr(token_actions, "wallet", fake)
+    monkeypatch.setattr(token_actions, "_action_persisted", AsyncMock(return_value=True))
+
+    async def lost_acknowledgment(reservation_id):
+        raise RuntimeError("simulated lost database acknowledgment after durable write")
+
+    result = run(execute_token_action(
+        {"id": "user-1", "billing_mode": "tokens_v1"},
+        amount=3, idempotency_key="request-key-006", reason="Create paid record",
+        action=lost_acknowledgment, reference_id="record-6", metadata={"action_type": "test"}
+    ))
+    assert result["already_processed"] is True
+    assert len(fake.commit_calls) == 1
+    assert fake.release_calls == []
+
+
 def test_execute_token_action_does_not_replay_an_inflight_reservation(monkeypatch):
     import token_actions
     fake = FakeWallet({
