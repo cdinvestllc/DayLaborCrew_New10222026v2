@@ -1080,6 +1080,32 @@ async def handle_paypal_event(event_value: Any) -> bool:
                       "status": "active", "updated_at": utc_iso()}}
         )
         return True
+    if event_type == "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+        candidates = [
+            resource.get("id"), resource.get("billing_agreement_id"),
+            resource.get("subscription_id"), (resource.get("supplementary_data") or {}).get("related_ids", {}).get("subscription_id")
+        ]
+        sub = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            sub = await db.billing_subscriptions.find_one(
+                {"provider": "paypal", "provider_subscription_id": candidate}, {"_id": 0}
+            )
+            if sub:
+                break
+        if not sub:
+            return False
+        await db.billing_subscriptions.update_one(
+            {"_id": sub["id"], "status": {"$nin": ["cancelled", "expired", "refunded"]}},
+            {"$set": {"status": "past_due", "last_payment_failed_at": utc_iso(),
+                      "last_failed_payment_reference": resource.get("id"), "updated_at": utc_iso()}}
+        )
+        await db.users.update_one(
+            {"billing_subscription_id": sub["id"]},
+            {"$set": {"billing_subscription_status": "past_due"}}
+        )
+        return True
     if event_type in {"BILLING.SUBSCRIPTION.CANCELLED", "BILLING.SUBSCRIPTION.SUSPENDED", "BILLING.SUBSCRIPTION.EXPIRED"}:
         provider_sub_id = resource.get("id")
         sub = await db.billing_subscriptions.find_one({"provider": "paypal", "provider_subscription_id": provider_sub_id}, {"_id": 0})
