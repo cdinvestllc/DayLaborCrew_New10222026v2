@@ -333,7 +333,11 @@ export default function ContractorDashboard() {
         fetchJobs();
       }
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Failed to post job");
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        jobSubmitIdempotency.current = null;
+      }
+      toast.error(detail || "Failed to post job");
     } finally {
       setPostingJob(false);
     }
