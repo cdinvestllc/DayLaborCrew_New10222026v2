@@ -92,7 +92,6 @@ async def verify_api_uses_staging_database(api_url: str, mongo_uri: str, db_name
             {"email": email}, {"_id": 0, "id": 1, "role": 1}
         )
     except Exception as exc:
-        client.close()
         raise RuntimeError(
             f"Could not read the seeded super-admin from the isolated staging DB ({type(exc).__name__})"
         ) from None
