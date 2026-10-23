@@ -12,6 +12,7 @@ STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https
 STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
 APP_NAME = "thedaylaborers"
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
 FILE_URL_PREFIX = "/api/public/files/"
 _storage_key = None
 
@@ -93,6 +94,41 @@ async def save_image(file: UploadFile, owner_id: str, category: str) -> str:
         "size": len(data),
         "is_deleted": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return FILE_URL_PREFIX + stored_path
+
+
+def detect_video(data: bytes) -> tuple[str, str] | None:
+    """Detect supported video containers from bytes, not the supplied MIME type."""
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        # MP4/MOV ISO Base Media File Format; extension is .mp4 for broad client support.
+        return "mp4", "video/mp4"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm", "video/webm"
+    return None
+
+
+async def save_video(file: UploadFile, owner_id: str, category: str) -> str:
+    """Validate and upload a small MP4/WebM file; duration is checked by the caller."""
+    data = await file.read(MAX_VIDEO_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Video file is empty")
+    if len(data) > MAX_VIDEO_BYTES:
+        raise HTTPException(status_code=400, detail="Video must be 50 MB or smaller")
+    detected = detect_video(data)
+    if not detected:
+        raise HTTPException(status_code=400, detail="Video must be a valid MP4 or WebM file")
+    ext, mime = detected
+    path = f"{APP_NAME}/{category}/{owner_id}/{uuid.uuid4().hex}.{ext}"
+    try:
+        result = await asyncio.to_thread(_put, path, data, mime)
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Video upload failed. Please try again.")
+    stored_path = result.get("path", path)
+    await db.files.insert_one({
+        "id": str(uuid.uuid4()), "storage_path": stored_path, "owner_id": owner_id,
+        "category": category, "content_type": mime, "size": len(data),
+        "is_deleted": False, "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return FILE_URL_PREFIX + stored_path
 
