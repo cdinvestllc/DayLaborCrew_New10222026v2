@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import secrets
@@ -265,7 +266,9 @@ async def upload_portfolio_video(
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key is required for video uploads.")
     key = _request_key(idempotency_key, "")
-    # Same request key means the same video record across retries, even if the first response was lost.
+    video_sha256 = hashlib.sha256(data).hexdigest()
+    # Same key maps to the same video record on retry. The hash also prevents reuse of
+    # the key for a different uploaded file.
     video_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"daylaborcrew:{current_user['id']}:{key}"))
     cost = int(catalog.token_costs.video_30_seconds_30_days)
 
@@ -281,7 +284,7 @@ async def upload_portfolio_video(
         record = {
             "id": video_id, "url": url, "duration_seconds": duration, "max_duration_seconds": VIDEO_DURATION_SECONDS,
             "created_at": utc_iso(now), "expires_at": utc_iso(now + timedelta(days=30)),
-            "reservation_id": reservation_id, "billing_source": "tokens"
+            "reservation_id": reservation_id, "billing_source": "tokens", "content_sha256": video_sha256
         }
         update = await db.users.update_one(
             {"id": current_user["id"],
@@ -302,7 +305,7 @@ async def upload_portfolio_video(
     result = await execute_token_action(
         current_user, amount=cost, idempotency_key=key, reason="Post 30-second portfolio video for 30 days",
         action=action, reference_id=video_id,
-        metadata={"action_type": "portfolio_video", "feature": "video_30_seconds_30_days", "video_id": video_id}
+        metadata={"action_type": "portfolio_video", "feature": "video_30_seconds_30_days", "video_id": video_id, "content_sha256": video_sha256}
     )
     payload = result.get("result") or {}
     if not payload:
