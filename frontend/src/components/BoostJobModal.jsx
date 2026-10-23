@@ -1,15 +1,42 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { X, Zap, CreditCard, DollarSign, CheckCircle, ExternalLink } from "lucide-react";
 import axios from "axios";
 import { toast } from "sonner";
+import { useAuth } from "../contexts/AuthContext";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 const BOOST_PRICE = 9.99;
 const BOOST_DAYS = 7;
 
 export default function BoostJobModal({ job, onClose, onSuccess }) {
+  const { user } = useAuth();
+  const tokenMode = user?.billing_mode === "tokens_v1";
   const [method, setMethod] = useState(null); // "stripe" | "paypal"
   const [loading, setLoading] = useState(false);
+  const [tokenCost, setTokenCost] = useState(10);
+
+  useEffect(() => {
+    if (!tokenMode) return;
+    axios.get(`${API}/billing/catalog`).then(res =>
+      setTokenCost(Number(res.data?.catalog?.token_costs?.contractor_job_boost ?? 10))
+    ).catch(() => {});
+  }, [tokenMode]);
+
+  const handleTokenBoost = async () => {
+    setLoading(true);
+    try {
+      const key = `jobboost:${job.id}:${job.boost_expires_at || "initial"}`;
+      const res = await axios.post(`${API}/billing/features/jobs/${job.id}/boost`, {}, {
+        headers: { "Idempotency-Key": key }
+      });
+      toast.success(`Job boosted for ${BOOST_DAYS} days. ${res.data.tokens_charged || tokenCost} tokens charged.`);
+      onSuccess?.();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Could not boost job with tokens");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleStripe = async () => {
     setLoading(true);
@@ -84,14 +111,25 @@ export default function BoostJobModal({ job, onClose, onSuccess }) {
         <div className="bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/30 dark:to-indigo-950/30 border border-blue-100 dark:border-blue-900 rounded-xl p-4 mb-5 flex items-center justify-between">
           <div>
             <p className="text-xs text-slate-500 font-semibold uppercase tracking-wide">Boost Price</p>
-            <p className="text-2xl font-extrabold text-[#0000FF]" style={{ fontFamily: "Manrope, sans-serif" }}>${BOOST_PRICE}</p>
+            <p className="text-2xl font-extrabold text-[#0000FF]" style={{ fontFamily: "Manrope, sans-serif" }}>
+              {tokenMode ? `${tokenCost} tokens` : `${BOOST_PRICE}`}
+            </p>
             <p className="text-xs text-slate-400">One-time · {BOOST_DAYS} days featured</p>
           </div>
           <Zap className="w-8 h-8 text-yellow-500" />
         </div>
 
-        {/* Payment buttons */}
-        {!method ? (
+        {tokenMode ? (
+          <button onClick={handleTokenBoost} disabled={loading}
+            className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#0000FF] text-white font-bold hover:bg-blue-700 disabled:opacity-60"
+            data-testid="boost-token-btn">
+            {loading ? <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white" /> : <Zap className="w-5 h-5" />}
+            Boost for {tokenCost} tokens
+          </button>
+        ) : null}
+
+        {/* Legacy checkout remains for grandfathered accounts. */}
+        {!tokenMode && !method ? (
           <div className="space-y-3">
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Choose Payment Method</p>
             <button onClick={() => setMethod("stripe")}
