@@ -366,7 +366,11 @@ async def delete_job(job_id: str, current_user: dict = Depends(get_current_user)
 
 
 @router.post("/{job_id}/accept")
-async def accept_job(job_id: str, current_user: dict = Depends(get_current_user)):
+async def accept_job(
+    job_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: dict = Depends(get_current_user)
+):
     if current_user["role"] != "crew":
         raise HTTPException(status_code=403, detail="Only crew members can accept jobs")
     from token_actions import execute_token_action, record_qualifying_activity, uses_token_billing
@@ -380,6 +384,18 @@ async def accept_job(job_id: str, current_user: dict = Depends(get_current_user)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if current_user["id"] in job.get("crew_accepted", []):
+        if uses_token_billing(current_user):
+            receipt = next((item for item in (job.get("crew_acceptance_receipts") or [])
+                            if item.get("crew_id") == current_user["id"]), None)
+            if receipt:
+                from token_billing import TokenWalletService
+                summary = await TokenWalletService(db).wallet_summary(current_user["id"])
+                await record_qualifying_activity(
+                    current_user["id"], "job_application", f"apply:{job_id}:{current_user['id']}",
+                    metadata={"job_id": job_id}
+                )
+                return {"message": "Job already accepted", "status": job.get("status", "open"),
+                        "tokens_charged": 0, "token_balance": summary["balance"], "already_processed": True}
         raise HTTPException(status_code=400, detail="Already accepted this job")
     if job.get("status") != "open":
         raise HTTPException(status_code=400, detail=f"Job is {job.get('status')}, cannot accept")
@@ -408,8 +424,11 @@ async def accept_job(job_id: str, current_user: dict = Depends(get_current_user)
     if token_mode:
         _, catalog = await __import__("token_actions").active_catalog()
         cost = int(catalog.token_costs.crew_apply_job)
+        action_key = (idempotency_key or f"applyjob:{job_id}:{current_user['id']}:{uuid.uuid4()}").strip()
+        if not 8 <= len(action_key) <= 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key must contain 8 to 128 characters.")
         result = await execute_token_action(
-            current_user, amount=cost, idempotency_key=f"applyjob:{job_id}:{current_user['id']}",
+            current_user, amount=cost, idempotency_key=action_key,
             reason="Apply to contractor job",
             action=perform_acceptance, reference_id=job_id,
             metadata={"action_type": "job_application", "job_id": job_id, "crew_id": current_user["id"]}
