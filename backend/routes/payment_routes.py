@@ -739,14 +739,14 @@ async def stripe_webhook(request: Request):
     event_type = event.get("type")
     supported = {
         "checkout.session.completed", "checkout.session.async_payment_succeeded",
-        "invoice.paid", "customer.subscription.deleted",
+        "invoice.paid", "invoice.payment_failed", "customer.subscription.updated",\n        "customer.subscription.deleted", "checkout.session.expired",
     }
     if event_type not in supported:
         return {"status": "ignored"}
     obj = (event.get("data", {}).get("object") or {})
     try:
         _stripe_api_key()  # Enforce test/live key-mode consistency for webhook deployments too.
-        if event_type in {"invoice.paid", "customer.subscription.deleted"}:
+        if event_type in {"invoice.paid", "invoice.payment_failed", "customer.subscription.updated", "customer.subscription.deleted"}:
             from routes.token_payment_routes import handle_stripe_event
             handled = await handle_stripe_event(event)
             return {"status": "ok" if handled else "ignored"}
