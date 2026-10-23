@@ -22,8 +22,6 @@ os.environ.setdefault("EMERGENT_LLM_KEY", "token-actions-placeholder")
 os.environ.setdefault("TRUSTED_PROXY_HOPS", "1")
 
 from token_actions import execute_token_action, record_qualifying_activity  # noqa: E402
-from token_billing import InsufficientTokens  # noqa: E402
-from routes import token_payment_routes  # noqa: E402
 
 
 class FakeWallet:
