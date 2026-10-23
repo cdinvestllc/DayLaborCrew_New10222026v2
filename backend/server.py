@@ -56,6 +56,7 @@ from routes.ws_routes import router as ws_router
 from routes.public_routes import router as public_router
 from routes.advertiser_routes import router as advertiser_router
 from routes.token_billing_routes import router as token_billing_router
+from routes.token_payment_routes import router as token_payment_router
 
 # Register routes
 api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
@@ -66,6 +67,7 @@ api_router.include_router(payment_router, prefix="/payments", tags=["payments"])
 api_router.include_router(public_router, prefix="/public", tags=["public"])
 api_router.include_router(advertiser_router, prefix="/advertisers", tags=["advertisers"])
 api_router.include_router(token_billing_router, prefix="/billing", tags=["billing"])
+api_router.include_router(token_payment_router, prefix="/billing", tags=["billing-payments"])
 api_router.include_router(ws_router)
 
 @api_router.get("/")
