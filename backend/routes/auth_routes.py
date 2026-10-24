@@ -14,6 +14,7 @@ from auth import (
     extract_token, bearer_scheme, get_current_user, limiter, log_security_event,
 )
 from utils.email_utils import send_welcome_email, send_password_reset_email
+from token_actions import token_billing_enabled
 import os
 import logging
 
@@ -170,16 +171,20 @@ async def register(data: UserCreate, request: Request, response: Response):
         "favorite_crew": [],
         "auth_provider": "email",
         "token_version": 0,
-        "billing_mode": "tokens_v1",
-        "token_plan": "trial_crew" if data.role == "crew" else "trial_contractor",
-        "billing_plan": "trial_crew" if data.role == "crew" else "trial_contractor",
-        "billing_subscription_status": "trial",
-        "token_trial_started_at": now,
-        "token_trial_end_at": token_trial_end_at,
-        "token_free_period_start": now,
-        "token_free_period_anchor": now,
-        "token_welcome_expiry_at": token_welcome_expiry_at,
     }
+
+    if token_billing_enabled():
+        user_doc.update({
+            "billing_mode": "tokens_v1",
+            "token_plan": "trial_crew" if data.role == "crew" else "trial_contractor",
+            "billing_plan": "trial_crew" if data.role == "crew" else "trial_contractor",
+            "billing_subscription_status": "trial",
+            "token_trial_started_at": now,
+            "token_trial_end_at": token_trial_end_at,
+            "token_free_period_start": now,
+            "token_free_period_anchor": now,
+            "token_welcome_expiry_at": token_welcome_expiry_at,
+        })
 
     referral_code = (data.referral_code_used or "").strip().upper()
     if referral_code:
@@ -196,7 +201,8 @@ async def register(data: UserCreate, request: Request, response: Response):
             })
 
     await db.users.insert_one(user_doc)
-    await _grant_initial_token_allowances(user_doc)
+    if token_billing_enabled():
+        await _grant_initial_token_allowances(user_doc)
     log_security_event("register", request, user=user_doc["id"], role=user_doc["role"])
     token = issue_session(response, user_doc)
     await send_welcome_email(data.name, email, data.role)
@@ -387,18 +393,22 @@ async def google_oauth_callback(request: Request, response: Response):
             "favorite_crew": [],
             "auth_provider": "google",
             "token_version": 0,
-            "billing_mode": "tokens_v1",
-            "token_plan": "trial_crew" if requested_role == "crew" else "trial_contractor",
-            "billing_plan": "trial_crew" if requested_role == "crew" else "trial_contractor",
-            "billing_subscription_status": "trial",
-            "token_trial_started_at": now,
-            "token_trial_end_at": token_trial_end_at,
-            "token_free_period_start": now,
-            "token_free_period_anchor": now,
-            "token_welcome_expiry_at": token_welcome_expiry_at,
         }
+        if token_billing_enabled():
+            user.update({
+                "billing_mode": "tokens_v1",
+                "token_plan": "trial_crew" if requested_role == "crew" else "trial_contractor",
+                "billing_plan": "trial_crew" if requested_role == "crew" else "trial_contractor",
+                "billing_subscription_status": "trial",
+                "token_trial_started_at": now,
+                "token_trial_end_at": token_trial_end_at,
+                "token_free_period_start": now,
+                "token_free_period_anchor": now,
+                "token_welcome_expiry_at": token_welcome_expiry_at,
+            })
         await db.users.insert_one(user)
-        await _grant_initial_token_allowances(user)
+        if token_billing_enabled():
+            await _grant_initial_token_allowances(user)
         log_security_event("register", request, user=user["id"], role=requested_role, provider="google")
         await send_welcome_email(name, email, requested_role)
     else:
