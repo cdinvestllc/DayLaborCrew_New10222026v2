@@ -431,3 +431,17 @@ def test_disabled_token_maintenance_fails_before_scheduler_auth_or_mutation(monk
         run(run_token_billing_maintenance(authorization=None, limit=250))
     assert exc.value.status_code == 503
     assert "disabled" in exc.value.detail.lower()
+
+
+
+def test_disabled_rollout_blocks_catalog_mutation_and_manual_token_grants(monkeypatch):
+    from routes.token_billing_routes import update_billing_catalog, admin_grant_tokens
+
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "false")
+    with pytest.raises(HTTPException) as catalog_exc:
+        run(update_billing_catalog(None, {"id": "admin", "role": "super_admin"}))
+    assert catalog_exc.value.status_code == 503
+
+    with pytest.raises(HTTPException) as grant_exc:
+        run(admin_grant_tokens("target-user", None, {"id": "admin", "role": "super_admin"}))
+    assert grant_exc.value.status_code == 503
