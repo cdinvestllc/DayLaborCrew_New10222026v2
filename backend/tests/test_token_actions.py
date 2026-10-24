@@ -21,7 +21,12 @@ os.environ.setdefault("CORS_ORIGINS", "http://localhost")
 os.environ.setdefault("EMERGENT_LLM_KEY", "token-actions-placeholder")
 os.environ.setdefault("TRUSTED_PROXY_HOPS", "1")
 
-from token_actions import execute_token_action, record_qualifying_activity  # noqa: E402
+from token_actions import execute_token_action, record_qualifying_activity, token_billing_enabled, uses_token_billing  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def enable_token_billing_for_existing_unit_tests(monkeypatch):
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "true")
 
 
 class FakeWallet:
@@ -366,3 +371,40 @@ def test_free_grant_period_anchor_advances_monthly_without_drifting(monkeypatch)
     ]
     assert period_start_updates == [expected_start.isoformat()]
     assert any(query.get("token_free_period_anchor") == {"$exists": False} for query, _update in users.updates)
+
+
+
+def test_token_billing_rollout_flag_is_fail_closed_by_default(monkeypatch):
+    monkeypatch.delenv("TOKEN_BILLING_ENABLED", raising=False)
+    assert token_billing_enabled() is False
+    assert uses_token_billing({"id": "u", "billing_mode": "tokens_v1"}) is False
+    assert uses_token_billing({"id": "u", "billing_subscription_id": "sub", "billing_subscription_status": "active"}) is False
+
+
+def test_token_billing_rollout_flag_requires_explicit_true(monkeypatch):
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "yes")
+    assert token_billing_enabled() is False
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "true")
+    assert token_billing_enabled() is True
+    assert uses_token_billing({"id": "u", "billing_mode": "tokens_v1"}) is True
+
+
+def test_disabled_token_billing_rejects_spending_before_reservation(monkeypatch):
+    import token_actions
+    fake = FakeWallet()
+    monkeypatch.setattr(token_actions, "wallet", fake)
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "false")
+    performed = []
+
+    async def business_action(_reservation_id):
+        performed.append(True)
+
+    with pytest.raises(HTTPException) as exc:
+        run(execute_token_action(
+            {"id": "user-disabled", "billing_mode": "tokens_v1"},
+            amount=5, idempotency_key="rollout-disabled-1", reason="test",
+            action=business_action, metadata={"action_type": "job_application"},
+        ))
+    assert exc.value.status_code == 409
+    assert fake.reserve_calls == []
+    assert performed == []
