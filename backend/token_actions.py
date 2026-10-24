@@ -45,7 +45,8 @@ def token_billing_enabled() -> bool:
 
 
 def uses_token_billing(user: dict | None) -> bool:
-    if not token_billing_enabled() or not user:
+    """Classify token-backed accounts independent of rollout state to prevent legacy fallback."""
+    if not user:
         return False
     if user.get("billing_mode") == "tokens_v1":
         return True
@@ -143,6 +144,8 @@ async def execute_token_action(
     left in place for reconciliation; it is never released on the assumption that the action
     did not happen.
     """
+    if not token_billing_enabled():
+        raise HTTPException(status_code=503, detail="Token billing is temporarily disabled while rollout validation is pending.")
     if not uses_token_billing(user):
         raise HTTPException(status_code=409, detail="This account is still on legacy billing; token checkout is unavailable for this action.")
     idempotency_key = _require_action_id(idempotency_key)
@@ -255,6 +258,8 @@ async def record_qualifying_activity(
 
 
 async def resolve_feature_entitlement(user: dict, *, role: str | None = None, pro: bool = False) -> BillingCatalog:
+    if not token_billing_enabled():
+        raise HTTPException(status_code=503, detail="Token billing is temporarily disabled while rollout validation is pending.")
     if user.get("role") in ADMIN_ROLES:
         _, catalog = await active_catalog()
         return catalog
