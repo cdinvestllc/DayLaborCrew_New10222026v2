@@ -38,8 +38,14 @@ async def active_catalog() -> tuple[int, BillingCatalog]:
     return int(record.get("version", 1)), BillingCatalog.model_validate(record.get("catalog") or DEFAULT_BILLING_CATALOG)
 
 
+def token_billing_enabled() -> bool:
+    """Production rollout gate. Token billing is disabled unless explicitly enabled."""
+    import os
+    return os.environ.get("TOKEN_BILLING_ENABLED", "").strip().lower() == "true"
+
+
 def uses_token_billing(user: dict | None) -> bool:
-    if not user:
+    if not token_billing_enabled() or not user:
         return False
     if user.get("billing_mode") == "tokens_v1":
         return True
@@ -227,7 +233,7 @@ async def record_qualifying_activity(
     if activity not in allowed:
         return False
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "billing_mode": 1})
-    if not user or user.get("billing_mode") != "tokens_v1":
+    if not token_billing_enabled() or not user or user.get("billing_mode") != "tokens_v1":
         return False
     try:
         await db.token_activity_events.create_index(
