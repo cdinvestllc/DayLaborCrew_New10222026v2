@@ -30,6 +30,7 @@ from token_billing import (
     TokenBillingError, TokenStoreUnavailable, TokenWalletService, utc_iso, utc_now
 )
 from routes.token_billing_routes import _active_catalog
+from token_actions import token_billing_enabled
 
 router = APIRouter()
 wallet = TokenWalletService(db)
@@ -147,7 +148,9 @@ def _ensure_provider_enabled(catalog: BillingCatalog, provider: str) -> None:
 
 
 def _ensure_token_checkout_allowed(user: dict) -> None:
-    """Avoid selling tokens while an account is still consuming grandfathered legacy benefits."""
+    """Fail closed until token billing is explicitly enabled for this deployment."""
+    if not token_billing_enabled():
+        raise HTTPException(status_code=503, detail="Token billing is temporarily disabled while rollout validation is pending.")
     if user.get("billing_mode") == "legacy_compat":
         cutover = user.get("legacy_token_cutover_at")
         when = f" until {cutover}" if cutover else " until your legacy paid-through period ends"
