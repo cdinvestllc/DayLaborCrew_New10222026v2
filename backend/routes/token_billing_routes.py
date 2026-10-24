@@ -12,6 +12,7 @@ from token_billing import (
     BillingCatalog, DEFAULT_BILLING_CATALOG, IdempotencyConflict, InsufficientTokens,
     TokenBillingError, TokenStoreUnavailable, TokenWalletService, utc_iso
 )
+from token_actions import token_billing_enabled
 
 router = APIRouter()
 wallet_service = TokenWalletService(db)
@@ -95,6 +96,8 @@ async def update_billing_catalog(
     current_user: dict = Depends(get_current_user)
 ):
     """Replace the whole validated catalog with optimistic version control and audit history."""
+    if not token_billing_enabled():
+        raise HTTPException(status_code=503, detail="Token billing is temporarily disabled while rollout validation is pending.")
     _require_admin(current_user)
     record = await _active_catalog()
     if record.get("version") != data.expected_version:
@@ -170,6 +173,8 @@ async def admin_grant_tokens(
     data: AdminTokenGrantRequest,
     current_user: dict = Depends(get_current_user)
 ):
+    if not token_billing_enabled():
+        raise HTTPException(status_code=503, detail="Token billing is temporarily disabled while rollout validation is pending.")
     _require_admin(current_user)
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1})
     if not user:
