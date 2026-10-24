@@ -408,3 +408,24 @@ def test_disabled_token_billing_rejects_spending_before_reservation(monkeypatch)
     assert exc.value.status_code == 409
     assert fake.reserve_calls == []
     assert performed == []
+
+
+
+def test_disabled_token_checkout_fails_closed(monkeypatch):
+    from routes.token_payment_routes import _ensure_token_checkout_allowed
+
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "false")
+    with pytest.raises(HTTPException) as exc:
+        _ensure_token_checkout_allowed({"id": "u", "billing_mode": "tokens_v1"})
+    assert exc.value.status_code == 503
+
+
+def test_disabled_token_maintenance_fails_before_scheduler_auth_or_mutation(monkeypatch):
+    from routes.token_feature_routes import run_token_billing_maintenance
+
+    monkeypatch.setenv("TOKEN_BILLING_ENABLED", "false")
+    monkeypatch.delenv("BILLING_SCHEDULER_SECRET", raising=False)
+    with pytest.raises(HTTPException) as exc:
+        run(run_token_billing_maintenance(authorization=None, limit=250))
+    assert exc.value.status_code == 503
+    assert "disabled" in exc.value.detail.lower()
