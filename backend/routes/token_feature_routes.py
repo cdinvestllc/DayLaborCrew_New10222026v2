@@ -18,7 +18,7 @@ from auth import get_current_user
 from database import db
 from token_actions import (
     active_catalog, execute_token_action, pro_entitled, record_qualifying_activity,
-    resolve_feature_entitlement, uses_token_billing, wallet
+    resolve_feature_entitlement, token_billing_enabled, uses_token_billing, wallet
 )
 from token_billing import utc_iso, utc_now
 from utils.storage import MAX_VIDEO_BYTES, detect_video, save_video
@@ -72,6 +72,8 @@ async def run_token_billing_maintenance(
     limit: int = Query(250, ge=1, le=1000)
 ):
     """Protected daily scheduler for migration, free grants, trials, and abandoned actions."""
+    if not token_billing_enabled():
+        raise HTTPException(status_code=503, detail="Token billing maintenance is disabled until rollout is enabled.")
     configured = (os.environ.get("BILLING_SCHEDULER_SECRET") or "").strip()
     supplied = (authorization or "").removeprefix("Bearer ").strip()
     if not configured:
