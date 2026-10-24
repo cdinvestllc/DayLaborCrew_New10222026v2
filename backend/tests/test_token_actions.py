@@ -377,8 +377,10 @@ def test_free_grant_period_anchor_advances_monthly_without_drifting(monkeypatch)
 def test_token_billing_rollout_flag_is_fail_closed_by_default(monkeypatch):
     monkeypatch.delenv("TOKEN_BILLING_ENABLED", raising=False)
     assert token_billing_enabled() is False
-    assert uses_token_billing({"id": "u", "billing_mode": "tokens_v1"}) is False
-    assert uses_token_billing({"id": "u", "billing_subscription_id": "sub", "billing_subscription_status": "active"}) is False
+    # Account classification must remain token-backed so disabled rollout cannot fall back
+    # to legacy-credit/free behavior in job routes.
+    assert uses_token_billing({"id": "u", "billing_mode": "tokens_v1"}) is True
+    assert uses_token_billing({"id": "u", "billing_subscription_id": "sub", "billing_subscription_status": "active"}) is True
 
 
 def test_token_billing_rollout_flag_requires_explicit_true(monkeypatch):
@@ -405,7 +407,7 @@ def test_disabled_token_billing_rejects_spending_before_reservation(monkeypatch)
             amount=5, idempotency_key="rollout-disabled-1", reason="test",
             action=business_action, metadata={"action_type": "job_application"},
         ))
-    assert exc.value.status_code == 409
+    assert exc.value.status_code == 503
     assert fake.reserve_calls == []
     assert performed == []
 
