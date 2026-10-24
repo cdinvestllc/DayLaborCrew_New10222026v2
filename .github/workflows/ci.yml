@@ -43,7 +43,7 @@ jobs:
       - name: Compile backend modules
         run: python -m compileall -q .
       - name: Run hermetic backend regression tests
-        run: pytest -q tests/test_payment_security.py tests/test_staging_config.py tests/test_stripe_amount.py
+        run: pytest -q tests/test_payment_security.py tests/test_staging_config.py tests/test_stripe_amount.py tests/test_token_billing.py tests/test_token_payments.py tests/test_token_actions.py
 
   frontend-tests:
     name: Frontend tests and production build

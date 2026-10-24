@@ -7,7 +7,7 @@ import { CertificationsEditor, CertificationsList } from "../components/Certific
 import ProfileChecklist from "../components/ProfileChecklist";
 import { toast } from "sonner";
 import axios from "axios";
-import { Camera, Star, Gift, Copy, Check, Edit2, Save, MapPin, Phone, Briefcase, User, Plus, X, Image, MessageSquare, Shield } from "lucide-react";
+import { Camera, Star, Gift, Copy, Check, Edit2, Save, MapPin, Phone, Briefcase, User, Plus, X, Image, MessageSquare, Shield, Zap, Video, Loader2 } from "lucide-react";
 import SafeImage from "../components/SafeImage";
 import { resolveImageUrl } from "../lib/media";
 
@@ -112,6 +112,14 @@ export default function ProfilePage() {
   const [newSkill, setNewSkill] = useState("");
   const [portfolioUploading, setPortfolioUploading] = useState(false);
   const [portfolio, setPortfolio] = useState([]);
+  const [portfolioVideos, setPortfolioVideos] = useState([]);
+  const [videoUploading, setVideoUploading] = useState(false);
+  const [profileBoosting, setProfileBoosting] = useState(false);
+  const [profileBoostCost, setProfileBoostCost] = useState(10);
+  const [portfolioVideoCost, setPortfolioVideoCost] = useState(2);
+  const videoRef = useRef(null);
+  const videoUploadRetry = useRef(null);
+  const profileBoostRequestKey = useRef(null);
   const [tradeOptions, setTradeOptions] = useState(TRADES);
   const [privacy, setPrivacy] = useState({});
   const fileRef = useRef(null);
@@ -127,6 +135,15 @@ export default function ProfilePage() {
       .catch(() => {});
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (user?.billing_mode !== "tokens_v1") return;
+    axios.get(`${API}/billing/catalog`).then(res => {
+      const costs = res.data?.catalog?.token_costs || {};
+      setProfileBoostCost(Number(costs.crew_profile_boost ?? 10));
+      setPortfolioVideoCost(Number(costs.video_30_seconds_30_days ?? 2));
+    }).catch(() => {});
+  }, [user?.billing_mode]);
 
   useEffect(() => {
     if (user) {
@@ -147,6 +164,7 @@ export default function ProfilePage() {
         certifications: user.certifications || [],
       });
       setPortfolio(user.portfolio || []);
+      setPortfolioVideos(user.portfolio_videos || []);
       setPrivacy(user.privacy || {});
     }
   }, [user]);
@@ -249,6 +267,72 @@ export default function ProfilePage() {
     }
   };
 
+  const handleProfileBoost = async () => {
+    setProfileBoosting(true);
+    try {
+      if (!profileBoostRequestKey.current) {
+        const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        profileBoostRequestKey.current = `profileboost:${user.id}:${requestId}`;
+      }
+      const res = await axios.post(`${API}/billing/features/profile/boost`, {}, {
+        headers: { "Idempotency-Key": profileBoostRequestKey.current }
+      });
+      profileBoostRequestKey.current = null;
+      updateUser({ profile_featured: true, profile_boost_expires_at: res.data.profile_boost_expires_at });
+      toast.success(`Profile featured for 7 days. ${res.data.tokens_charged ?? profileBoostCost} tokens charged.`);
+      await refreshUser();
+    } catch (e) {
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        profileBoostRequestKey.current = null;
+      }
+      toast.error(detail || "Could not boost profile");
+    } finally {
+      setProfileBoosting(false);
+    }
+  };
+
+  const handlePortfolioVideoUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (user?.billing_mode !== "tokens_v1") {
+      toast.error("Video portfolios are available after token billing migration.");
+      return;
+    }
+    setVideoUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const fingerprint = `${file.name}:${file.size}:${file.lastModified}`;
+      if (!videoUploadRetry.current || videoUploadRetry.current.fingerprint !== fingerprint) {
+        const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        videoUploadRetry.current = { fingerprint, key: `portfoliovideo:${user.id}:${requestId}` };
+      }
+      const res = await axios.post(`${API}/billing/features/portfolio/video`, formData, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+          "Idempotency-Key": videoUploadRetry.current.key
+        }
+      });
+      videoUploadRetry.current = null;
+      const video = res.data.video;
+      const videos = video ? [...portfolioVideos.filter(v => v.id !== video.id), video] : portfolioVideos;
+      setPortfolioVideos(videos);
+      updateUser({ portfolio_videos: videos });
+      toast.success(`Video added for 30 days. ${res.data.tokens_charged ?? portfolioVideoCost} tokens charged.`);
+      await refreshUser();
+    } catch (e) {
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        videoUploadRetry.current = null;
+      }
+      toast.error(detail || "Could not upload portfolio video");
+    } finally {
+      setVideoUploading(false);
+    }
+  };
+
   const copyReferral = () => {
     navigator.clipboard.writeText(user?.referral_code || "");
     setCopied(true);
@@ -306,6 +390,10 @@ export default function ProfilePage() {
   };
 
   const profilePhoto = user?.profile_photo || user?.logo;
+  const tokenProEntitled = user?.billing_mode === "tokens_v1" && (
+    (user?.billing_subscription_status === "active" && ["pro_crew", "pro_contractor"].includes(user?.billing_plan)) ||
+    (user?.billing_subscription_status === "trial" && user?.token_trial_end_at && new Date(user.token_trial_end_at) > new Date())
+  );
 
 
   return (
@@ -350,6 +438,23 @@ export default function ProfilePage() {
                 ))}
                 <span className="text-sm text-slate-500 ml-1">({user?.rating_count || 0})</span>
               </div>
+
+              {user?.role === "crew" && tokenProEntitled && (
+                <div className="mt-4 rounded-xl border border-indigo-200 dark:border-indigo-800 bg-indigo-50/70 dark:bg-indigo-950/30 p-3 text-left">
+                  <div className="flex items-center gap-2 mb-1">
+                    <Zap className="w-4 h-4 text-indigo-600 dark:text-indigo-300" />
+                    <p className="font-bold text-sm text-indigo-900 dark:text-indigo-100">Featured Profile</p>
+                  </div>
+                  <p className="text-xs text-slate-600 dark:text-slate-300 mb-2">Boost your profile in crew discovery for 7 days.</p>
+                  <button onClick={handleProfileBoost} disabled={profileBoosting || (user.profile_boost_expires_at && new Date(user.profile_boost_expires_at) > new Date())}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-indigo-700 text-white text-sm font-semibold py-2 disabled:opacity-60">
+                    {profileBoosting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                    {user.profile_boost_expires_at && new Date(user.profile_boost_expires_at) > new Date()
+                      ? `Featured until ${new Date(user.profile_boost_expires_at).toLocaleDateString()}`
+                      : `Boost for ${profileBoostCost} tokens`}
+                  </button>
+                </div>
+              )}
 
               <button onClick={shareProfile}
                 className="mt-2 flex items-center gap-1.5 text-xs text-[#0000FF] font-semibold hover:underline"
@@ -588,6 +693,39 @@ export default function ProfilePage() {
                       </button>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {tokenProEntitled && (
+                <div className="mt-5 border-t border-slate-200 dark:border-slate-700 pt-4">
+                  <div className="flex items-center justify-between gap-3 mb-3">
+                    <div>
+                      <h4 className="font-bold text-[#050A30] dark:text-white flex items-center gap-2">
+                        <Video className="w-4 h-4 text-[#0000FF]" /> Video Portfolio
+                      </h4>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">MP4/WebM, maximum 30 seconds and 50 MB. Each video is featured for 30 days.</p>
+                    </div>
+                    <button onClick={() => videoRef.current?.click()} disabled={videoUploading}
+                      className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#0000FF] text-white rounded-lg text-sm font-semibold hover:bg-blue-700 disabled:opacity-60">
+                      {videoUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                      {videoUploading ? "Uploading..." : `Add Video · ${portfolioVideoCost} tokens`}
+                    </button>
+                    <input ref={videoRef} type="file" accept="video/mp4,video/webm,.mp4,.webm"
+                      className="hidden" onChange={handlePortfolioVideoUpload} />
+                  </div>
+                  {(portfolioVideos || []).filter(video => !video.expires_at || new Date(video.expires_at) > new Date()).length === 0 ? (
+                    <p className="text-sm text-slate-400">No active portfolio videos.</p>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {(portfolioVideos || []).filter(video => !video.expires_at || new Date(video.expires_at) > new Date()).map(video => (
+                        <div key={video.id} className="rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700">
+                          <video src={resolveImageUrl(video.url)} controls playsInline preload="metadata"
+                            className="w-full aspect-video bg-black" aria-label="Work portfolio video" />
+                          <p className="px-3 py-2 text-xs text-slate-500">Expires {video.expires_at ? new Date(video.expires_at).toLocaleDateString() : "—"}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

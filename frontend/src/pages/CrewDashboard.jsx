@@ -289,7 +289,10 @@ export default function CrewDashboard() {
       return;
     }
     try {
-      await axios.post(`${API}/jobs/${jobId}/accept`);
+      const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      await axios.post(`${API}/jobs/${jobId}/accept`, {}, {
+        headers: { "Idempotency-Key": `applyjob:${jobId}:${user?.id || "crew"}:${requestId}` }
+      });
       toast.success(t("Job accepted!"));
       fetchJobs();
       fetchMyJobs();

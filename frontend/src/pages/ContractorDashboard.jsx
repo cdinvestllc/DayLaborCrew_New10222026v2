@@ -77,6 +77,10 @@ export default function ContractorDashboard() {
   const [selectedState, setSelectedState] = useState("");
   const [boostJob, setBoostJob] = useState(null);
   const [verifiedFee, setVerifiedFee] = useState(39.99);
+  const [verifiedTokenCost, setVerifiedTokenCost] = useState({ standard: 100, pro: 80 });
+  const [emergencyTokenCost, setEmergencyTokenCost] = useState(20);
+  const jobSubmitIdempotency = useRef(null);
+  const verificationRequestKey = useRef(null);
   const [verifiedLoading, setVerifiedLoading] = useState(false);
   const [pollingVerified, setPollingVerified] = useState(false);
   const [emergencyFee, setEmergencyFee] = useState(2.99);
@@ -131,6 +135,11 @@ export default function ContractorDashboard() {
     // Fetch verified contractor fee
     axios.get(`${API}/payments/verified-contractor/fee`).then(r => setVerifiedFee(r.data.fee)).catch(() => {});
     axios.get(`${API}/payments/emergency/fee`).then(r => setEmergencyFee(r.data.fee)).catch(() => {});
+    axios.get(`${API}/billing/catalog`).then(r => {
+      const costs = r.data?.catalog?.token_costs || {};
+      setVerifiedTokenCost({ standard: Number(costs.verified_contractor_renewal ?? 100), pro: Number(costs.pro_verified_contractor_renewal ?? 80) });
+      setEmergencyTokenCost(Number(costs.contractor_post_job ?? 10) + Number(costs.emergency_job_surcharge ?? 10));
+    }).catch(() => {});
   }, [fetchJobs, fetchCrew]);
 
   // Poll verified contractor payment status when redirected back
@@ -270,10 +279,28 @@ export default function ContractorDashboard() {
   const startVerifiedCheckout = async () => {
     setVerifiedLoading(true);
     try {
+      if (user?.billing_mode === "tokens_v1") {
+        if (!verificationRequestKey.current) {
+          const requestId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          verificationRequestKey.current = `verification:${user.id}:${requestId}`;
+        }
+        const res = await axios.post(`${API}/billing/features/verification/renew`, {}, {
+          headers: { "Idempotency-Key": verificationRequestKey.current }
+        });
+        verificationRequestKey.current = null;
+        setUser(u => ({ ...u, is_verified_contractor: true, verified_expires_at: res.data.verified_expires_at }));
+        toast.success(`Verification renewed for one year. ${res.data.tokens_charged} tokens charged.`);
+        setVerifiedLoading(false);
+        return;
+      }
       const res = await axios.post(`${API}/payments/verified-contractor/create-session`, { origin_url: window.location.origin });
       window.location.href = res.data.url;
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Could not start checkout");
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        verificationRequestKey.current = null;
+      }
+      toast.error(detail || "Could not start checkout");
       setVerifiedLoading(false);
     }
   };
@@ -285,17 +312,24 @@ export default function ContractorDashboard() {
       return toast.error("End time must be after start time");
     }
     const confirmMsg = jobForm.is_emergency
-      ? `Post "${jobForm.title}" as an EMERGENCY job? You'll pay a one-time $${emergencyFee.toFixed(2)} Emergency Job Start fee, then crew are alerted immediately.`
+      ? (user?.billing_mode === "tokens_v1"
+          ? `Post "${jobForm.title}" as an EMERGENCY job for ${emergencyTokenCost} tokens? Crew are alerted immediately.`
+          : `Post "${jobForm.title}" as an EMERGENCY job? You'll pay a one-time $${emergencyFee.toFixed(2)} Emergency Job Start fee, then crew are alerted immediately.`)
       : `Publish "${jobForm.title}" now? Crew will be notified immediately.`;
     if (!window.confirm(confirmMsg)) return;
     setPostingJob(true);
     try {
+      if (!jobSubmitIdempotency.current) {
+        const randomId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        jobSubmitIdempotency.current = `jobpost:${user?.id || "user"}:${randomId}`;
+      }
       const res = await axios.post(`${API}/jobs/`, {
         ...jobForm,
         crew_needed: Number(jobForm.crew_needed),
         pay_rate: Number(jobForm.pay_rate)
-      });
+      }, { headers: { "Idempotency-Key": jobSubmitIdempotency.current } });
       const newJob = res.data;
+      jobSubmitIdempotency.current = null;
       // Show the new job right away, then sync with the server
       setJobs(prev => [newJob, ...prev.filter(j => j.id !== newJob.id)]);
       setShowJobForm(false);
@@ -308,7 +342,11 @@ export default function ContractorDashboard() {
         fetchJobs();
       }
     } catch (e) {
-      toast.error(e?.response?.data?.detail || "Failed to post job");
+      const detail = e?.response?.data?.detail || "";
+      if (e?.response && !(e.response.status === 409 && String(detail).includes("already processing"))) {
+        jobSubmitIdempotency.current = null;
+      }
+      toast.error(detail || "Failed to post job");
     } finally {
       setPostingJob(false);
     }
@@ -447,7 +485,7 @@ export default function ContractorDashboard() {
               className="flex items-center gap-2 bg-white text-[#0000FF] px-5 py-2.5 rounded-xl font-extrabold text-sm hover:bg-blue-50 transition-colors disabled:opacity-70 flex-shrink-0"
               data-testid="get-verified-btn">
               {verifiedLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
-              {verifiedLoading ? "Loading..." : `Get Verified — $${verifiedFee}`}
+              {verifiedLoading ? "Loading..." : user?.billing_mode === "tokens_v1" ? `Get Verified — ${(user?.billing_plan === "pro_contractor" || user?.billing_subscription_status === "trial") ? verifiedTokenCost.pro : verifiedTokenCost.standard} tokens` : `Get Verified — ${verifiedFee}`}
             </button>
           </div>
         )}

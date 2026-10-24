@@ -1,10 +1,11 @@
 """Field-whitelisted user views; contact details only for authorized viewers."""
+from datetime import datetime, timezone
 from database import db
 from utils.geocoding import valid_coords
 
 PUBLIC_FIELDS = (
     "id", "name", "role", "bio", "trade", "skills", "rating", "rating_count", "jobs_completed",
-    "availability", "portfolio", "company_name", "created_at", "profile_photo", "logo",
+    "availability", "portfolio", "portfolio_videos", "company_name", "created_at", "profile_photo", "logo",
     "transportation", "certifications", "is_verified_contractor", "verified_contractor_at", "is_insured",
 )
 STAFF_ROLES = ("admin", "super_admin")
@@ -46,6 +47,26 @@ async def has_contact_access(viewer: dict | None, target: dict) -> bool:
 async def build_user_view(target: dict, viewer: dict | None, include_coords: bool = False) -> dict:
     view = {k: target.get(k) for k in PUBLIC_FIELDS if k in target}
     view.setdefault("portfolio", [])
+    # Filter expired Pro videos on every public/self view, even if the daily cleanup
+    # scheduler is delayed or has temporarily failed.
+    now = datetime.now(timezone.utc)
+    videos = []
+    for video in view.get("portfolio_videos") or []:
+        expires = video.get("expires_at")
+        try:
+            expiry = datetime.fromisoformat(expires.replace("Z", "+00:00")) if isinstance(expires, str) else expires
+            if expiry is None:
+                continue
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry > now:
+                videos.append({
+                    key: video[key] for key in ("id", "url", "duration_seconds", "created_at", "expires_at")
+                    if key in video
+                })
+        except (TypeError, ValueError):
+            continue
+    view["portfolio_videos"] = videos
     privacy = target.get("privacy") or {}
     is_self = bool(viewer) and viewer["id"] == target["id"]
     hide_location = (privacy.get("hide_location") or target.get("hide_location")) and not is_self

@@ -1,6 +1,8 @@
 import uuid
+import hashlib
+import json
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, Header
 from database import db
 from auth import get_current_user, user_to_response
 from models import JobCreate, JobUpdate, RatingCreate, ClockInRequest, DisputeCreate, DisputeMessageCreate, DisputeAppealCreate
@@ -58,57 +60,149 @@ router = APIRouter()
 
 
 @router.post("/", status_code=201)
-async def create_job(data: JobCreate, current_user: dict = Depends(get_current_user)):
+async def create_job(
+    data: JobCreate,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: dict = Depends(get_current_user)
+):
     if current_user["role"] != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can post jobs")
-    from routes.payment_routes import consume_job_post_credit
-    await consume_job_post_credit(current_user)
 
+    # Validate input/address/images before reserving legacy credits or tokens.
     coords = valid_coords(data.lat, data.lng)
     if coords:
         location = {"address": data.address, "lat": coords[0], "lng": coords[1], "city": data.city or "", "state": data.state or ""}
     else:
         location = await geocode_address(data.address)
     if not location:
-        from routes.payment_routes import refund_job_post_credit
-        await refund_job_post_credit(current_user)
         raise HTTPException(status_code=400, detail="We couldn't locate that address. Please pick a suggested address.")
     images = _validated_job_images(data.images, current_user["id"])
+    request_fingerprint = hashlib.sha256(json.dumps(
+        {"payload": data.model_dump(mode="json"), "location": location, "images": images},
+        sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")).hexdigest()
+    from token_actions import active_catalog, execute_token_action, record_qualifying_activity, uses_token_billing
+    from token_billing import utc_iso
+    token_mode = uses_token_billing(current_user)
+    is_emergency = bool(data.is_emergency)
+    action_key = (idempotency_key or "").strip()
+    existing_reservation = None
+    job_id = str(uuid.uuid4())
+    if token_mode and action_key:
+        if not 8 <= len(action_key) <= 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key must contain 8 to 128 characters.")
+        existing_reservation = await db.token_reservations.find_one(
+            {"user_id": current_user["id"], "idempotency_key": action_key}, {"_id": 0}
+        )
+        if existing_reservation:
+            existing_metadata = existing_reservation.get("metadata") or {}
+            if existing_metadata.get("action_type") != "job_posting":
+                raise HTTPException(status_code=409, detail="Idempotency-Key was used for a different action.")
+            if existing_metadata.get("request_fingerprint") != request_fingerprint:
+                raise HTTPException(status_code=409, detail="Idempotency-Key was already used with different job details.")
+            original_job_id = existing_reservation.get("reference_id")
+            if original_job_id:
+                job_id = original_job_id
+                existing_job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
+                if existing_job:
+                    if existing_reservation.get("status") == "reserved":
+                        try:
+                            await __import__("token_billing").TokenWalletService(db).commit_reservation(
+                                current_user["id"], existing_reservation["reservation_id"],
+                                metadata={"action_succeeded": True, "reconciled_from_job": True}
+                            )
+                        except Exception:
+                            raise HTTPException(status_code=503, detail="Job is saved; billing reconciliation is pending.") from None
+                    await record_qualifying_activity(
+                        current_user["id"], "job_posting", f"jobpost:{job_id}",
+                        metadata={"job_id": job_id, "emergency": bool(existing_job.get("is_emergency"))}
+                    )
+                    if not existing_job.get("token_publication_dispatched_at"):
+                        try:
+                            await _publish_token_job_after_commit(existing_job)
+                        except Exception as exc:
+                            logger.warning("Token job publication retry deferred: %s", type(exc).__name__)
+                    balance = await __import__("token_billing").TokenWalletService(db).wallet_summary(current_user["id"])
+                    return {**existing_job, "tokens_charged": 0,
+                            "token_balance": balance["balance"], "already_processed": True}
+    if token_mode:
+        if not action_key:
+            raise HTTPException(status_code=400, detail="Idempotency-Key is required for token-funded job postings.")
+        _, catalog = await active_catalog()
+        cost = int(catalog.token_costs.contractor_post_job)
+        if is_emergency:
+            cost += int(catalog.token_costs.emergency_job_surcharge)
+        job_doc = {
+            "id": job_id, "contractor_id": current_user["id"],
+            "contractor_name": current_user.get("company_name") or current_user["name"],
+            "contractor_photo": current_user.get("logo") or current_user.get("profile_photo"),
+            "title": data.title, "description": data.description, "trade": data.trade,
+            "crew_needed": data.crew_needed, "crew_accepted": [],
+            "start_time": data.start_time, "end_time": data.end_time, "pay_rate": data.pay_rate,
+            "location": location, "status": "open", "is_emergency": is_emergency,
+            "emergency_paid": is_emergency, "created_at": now_str(), "completed_at": None,
+            "rated_crew": [], "rated_by_crew": [], "invited_crew": [], "images": images,
+            "billing_source": "tokens", "token_cost": cost
+        }
 
+        async def persist_job(reservation_id: str):
+            doc = {**job_doc, "token_reservation_id": reservation_id}
+            await db.jobs.insert_one(doc)
+            doc.pop("_id", None)
+            return doc
+
+        result = await execute_token_action(
+            current_user, amount=cost, idempotency_key=action_key,
+            reason="Post emergency job" if is_emergency else "Post contractor job",
+            action=persist_job, reference_id=job_id,
+            metadata={"action_type": "job_posting", "job_id": job_id, "emergency": is_emergency,
+                      "request_fingerprint": request_fingerprint}
+        )
+        saved = result.get("result")
+        if not saved:
+            saved = await db.jobs.find_one({"token_reservation_id": result.get("reservation_id")}, {"_id": 0})
+        if not saved:
+            saved = await db.jobs.find_one({"id": job_id}, {"_id": 0})
+        await record_qualifying_activity(
+            current_user["id"], "job_posting", f"jobpost:{job_id}",
+            metadata={"job_id": job_id, "emergency": is_emergency}
+        )
+        if not saved:
+            raise HTTPException(status_code=503, detail="Job was saved but is still being reconciled; refresh your jobs shortly.")
+        try:
+            await _publish_token_job_after_commit(saved)
+        except Exception as exc:
+            logger.warning("Token job publication deferred: %s", type(exc).__name__)
+        return {**saved, "tokens_charged": 0 if result["already_processed"] else cost, "token_balance": result["balance"],
+                "already_processed": result["already_processed"]}
+
+    # Legacy-paid accounts remain on the existing credit system until their paid-through
+    # date. This avoids charging legacy subscribers tokens for a feature they already bought.
+    from routes.payment_routes import consume_job_post_credit, refund_job_post_credit
+    await consume_job_post_credit(current_user)
     job_doc = {
-        "id": str(uuid.uuid4()),
-        "contractor_id": current_user["id"],
+        "id": job_id, "contractor_id": current_user["id"],
         "contractor_name": current_user.get("company_name") or current_user["name"],
         "contractor_photo": current_user.get("logo") or current_user.get("profile_photo"),
-        "title": data.title,
-        "description": data.description,
-        "trade": data.trade,
-        "crew_needed": data.crew_needed,
-        "crew_accepted": [],
-        "start_time": data.start_time,
-        "end_time": data.end_time,
-        "pay_rate": data.pay_rate,
-        "location": location,
-        # Emergency jobs stay hidden from crew until the one-time emergency fee is paid
-        "status": "pending_payment" if data.is_emergency else "open",
-        "is_emergency": bool(data.is_emergency),
-        "emergency_paid": False,
-        "created_at": now_str(),
-        "completed_at": None,
-        "rated_crew": [],
-        "rated_by_crew": [],
-        "invited_crew": [],
-        "images": images,
+        "title": data.title, "description": data.description, "trade": data.trade,
+        "crew_needed": data.crew_needed, "crew_accepted": [],
+        "start_time": data.start_time, "end_time": data.end_time, "pay_rate": data.pay_rate,
+        "location": location, "status": "pending_payment" if is_emergency else "open",
+        "is_emergency": is_emergency, "emergency_paid": False, "created_at": now_str(),
+        "completed_at": None, "rated_crew": [], "rated_by_crew": [], "invited_crew": [], "images": images
     }
-
-    await db.jobs.insert_one(job_doc)
+    try:
+        await db.jobs.insert_one(job_doc)
+    except Exception:
+        await refund_job_post_credit(current_user)
+        raise
     job_doc.pop("_id", None)
-
     if job_doc["status"] == "pending_payment":
         from routes.payment_routes import get_emergency_price
         return {**job_doc, "requires_payment": True, "emergency_fee": await get_emergency_price()}
-
     await publish_job(job_doc)
+    await record_qualifying_activity(current_user["id"], "job_posting", f"jobpost:{job_id}",
+                                     metadata={"job_id": job_id, "emergency": False})
     return job_doc
 
 
@@ -121,6 +215,17 @@ async def publish_job(job_doc: dict):
         logger.warning(f"WS broadcast failed: {e}")
     import asyncio
     asyncio.create_task(_run_ai_match(job_doc))
+
+
+async def _publish_token_job_after_commit(job_doc: dict) -> None:
+    """Notifications are post-commit side effects, never part of the refundable action."""
+    if not job_doc or job_doc.get("token_publication_dispatched_at"):
+        return
+    await publish_job(job_doc)
+    await db.jobs.update_one(
+        {"id": job_doc["id"], "token_publication_dispatched_at": {"$exists": False}},
+        {"$set": {"token_publication_dispatched_at": now_str()}}
+    )
 
 
 def _validated_job_images(images, user_id: str) -> list:
@@ -167,6 +272,23 @@ async def list_jobs(
     if smart_match and current_user["role"] == "crew" and jobs:
         jobs = await generate_smart_job_matches(jobs, current_user)
 
+    # Active token-paid boosts outrank organic jobs in crew feeds. Expired boosts
+    # stop ranking immediately even if the cleanup worker has not run yet.
+    ranking_now = datetime.now(timezone.utc)
+    def _active_job_boost(job: dict) -> bool:
+        if not job.get("is_featured") or not job.get("boost_expires_at"):
+            return False
+        try:
+            expires = datetime.fromisoformat(str(job["boost_expires_at"]).replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            return expires > ranking_now
+        except (TypeError, ValueError):
+            return False
+    jobs.sort(key=lambda job: (
+        _active_job_boost(job),
+        str(job.get("created_at") or "")
+    ), reverse=True)
     return jobs
 
 
@@ -273,56 +395,118 @@ async def delete_job(job_id: str, current_user: dict = Depends(get_current_user)
 
 
 @router.post("/{job_id}/accept")
-async def accept_job(job_id: str, current_user: dict = Depends(get_current_user)):
+async def accept_job(
+    job_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    current_user: dict = Depends(get_current_user)
+):
     if current_user["role"] != "crew":
         raise HTTPException(status_code=403, detail="Only crew members can accept jobs")
+    from token_actions import execute_token_action, record_qualifying_activity, uses_token_billing
 
-    from routes.payment_routes import require_active_subscription
-    require_active_subscription(current_user)
+    token_mode = uses_token_billing(current_user)
+    if not token_mode:
+        from routes.payment_routes import require_active_subscription
+        require_active_subscription(current_user)
+
     job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if current_user["id"] in job["crew_accepted"]:
+    if current_user["id"] in job.get("crew_accepted", []):
+        if uses_token_billing(current_user):
+            receipt = next((item for item in (job.get("crew_acceptance_receipts") or [])
+                            if item.get("crew_id") == current_user["id"]), None)
+            if receipt:
+                from token_billing import TokenWalletService
+                wallet_service = TokenWalletService(db)
+                saved_reservation = await db.token_reservations.find_one(
+                    {"reservation_id": receipt.get("reservation_id"), "user_id": current_user["id"]},
+                    {"_id": 0, "status": 1, "reservation_id": 1}
+                ) if receipt.get("reservation_id") else None
+                if saved_reservation and saved_reservation.get("status") == "reserved":
+                    await wallet_service.commit_reservation(
+                        current_user["id"], saved_reservation["reservation_id"],
+                        metadata={"action_succeeded": True, "recovered_from_duplicate_accept": True}
+                    )
+                summary = await wallet_service.wallet_summary(current_user["id"])
+                await record_qualifying_activity(
+                    current_user["id"], "job_application", f"apply:{job_id}:{current_user['id']}",
+                    metadata={"job_id": job_id}
+                )
+                return {"message": "Job already accepted", "status": job.get("status", "open"),
+                        "tokens_charged": 0, "token_balance": summary["balance"], "already_processed": True}
         raise HTTPException(status_code=400, detail="Already accepted this job")
-    if job["status"] != "open":
-        raise HTTPException(status_code=400, detail=f"Job is {job['status']}, cannot accept")
+    if job.get("status") != "open":
+        raise HTTPException(status_code=400, detail=f"Job is {job.get('status')}, cannot accept")
 
-    # Atomic: only succeeds while the job is open, not full, and the crew member isn't already on it
-    job = await db.jobs.find_one_and_update(
-        {"id": job_id, "status": "open", "crew_accepted": {"$ne": current_user["id"]},
-         "$expr": {"$lt": [{"$size": "$crew_accepted"}, "$crew_needed"]}},
-        {"$push": {"crew_accepted": current_user["id"]}, "$pull": {"invited_crew": current_user["id"]}},
-        return_document=True, projection={"_id": 0},
-    )
-    if not job:
-        raise HTTPException(status_code=409, detail="This job is no longer accepting crew")
-    new_crew = job["crew_accepted"]
-    new_status = "open"
-    if len(new_crew) >= job["crew_needed"]:
-        await db.jobs.update_one({"id": job_id, "status": "open"}, {"$set": {"status": "fulfilled"}})
-        new_status = "fulfilled"
+    async def perform_acceptance(reservation_id: str | None = None):
+        update = {"$push": {"crew_accepted": current_user["id"]},
+                  "$pull": {"invited_crew": current_user["id"]}}
+        if reservation_id:
+            update["$push"]["crew_acceptance_receipts"] = {
+                "crew_id": current_user["id"], "reservation_id": reservation_id, "accepted_at": now_str()
+            }
+        changed_job = await db.jobs.find_one_and_update(
+            {"id": job_id, "status": "open", "crew_accepted": {"$ne": current_user["id"]},
+             "$expr": {"$lt": [{"$size": "$crew_accepted"}, "$crew_needed"]}},
+            update, return_document=True, projection={"_id": 0},
+        )
+        if not changed_job:
+            raise HTTPException(status_code=409, detail="This job is no longer accepting crew")
+        new_crew = changed_job["crew_accepted"]
+        new_status = "open"
+        if len(new_crew) >= changed_job["crew_needed"]:
+            await db.jobs.update_one({"id": job_id, "status": "open"}, {"$set": {"status": "fulfilled"}})
+            new_status = "fulfilled"
+        return {"job": changed_job, "status": new_status}
+
+    if token_mode:
+        _, catalog = await __import__("token_actions").active_catalog()
+        cost = int(catalog.token_costs.crew_apply_job)
+        action_key = (idempotency_key or f"applyjob:{job_id}:{current_user['id']}:{uuid.uuid4()}").strip()
+        if not 8 <= len(action_key) <= 128:
+            raise HTTPException(status_code=400, detail="Idempotency-Key must contain 8 to 128 characters.")
+        result = await execute_token_action(
+            current_user, amount=cost, idempotency_key=action_key,
+            reason="Apply to contractor job",
+            action=perform_acceptance, reference_id=job_id,
+            metadata={"action_type": "job_application", "job_id": job_id, "crew_id": current_user["id"]}
+        )
+        accepted = result.get("result")
+        if not accepted:
+            accepted_doc = await db.jobs.find_one({"id": job_id}, {"_id": 0, "crew_accepted": 1, "status": 1})
+            accepted = {"job": accepted_doc or {}, "status": (accepted_doc or {}).get("status", "open")}
+        await record_qualifying_activity(
+            current_user["id"], "job_application", f"apply:{job_id}:{current_user['id']}",
+            metadata={"job_id": job_id}
+        )
+        cost_charged = cost
+    else:
+        accepted = await perform_acceptance()
+        cost_charged = 0
 
     # Notify contractor via WebSocket
     try:
         from routes.ws_routes import manager
         await manager.send_to_user(job["contractor_id"], {
-            "type": "job_accepted",
-            "job_id": job_id,
-            "crew_name": current_user["name"],
-            "crew_count": len(new_crew),
-            "crew_needed": job["crew_needed"]
+            "type": "job_accepted", "job_id": job_id, "crew_name": current_user["name"],
+            "crew_count": len(accepted["job"].get("crew_accepted", [])), "crew_needed": job["crew_needed"]
         })
     except Exception:
         pass
 
-    # Send push notification to contractor
     try:
         from utils.push_utils import send_push_notification
-        await send_push_notification(db, job["contractor_id"], "job_accepted", job_title=job.get("title", ""), crew_name=current_user["name"])
+        await send_push_notification(db, job["contractor_id"], "job_accepted",
+                                     job_title=job.get("title", ""), crew_name=current_user["name"])
     except Exception:
         pass
 
-    return {"message": "Job accepted", "status": new_status}
+    response = {"message": "Job accepted", "status": accepted["status"]}
+    if token_mode:
+        response.update({"tokens_charged": cost_charged, "token_balance": result["balance"],
+                         "already_processed": result["already_processed"]})
+    return response
 
 
 @router.post("/{job_id}/start")

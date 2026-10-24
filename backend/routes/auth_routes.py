@@ -14,6 +14,7 @@ from auth import (
     extract_token, bearer_scheme, get_current_user, limiter, log_security_event,
 )
 from utils.email_utils import send_welcome_email, send_password_reset_email
+from token_actions import token_billing_enabled
 import os
 import logging
 
@@ -35,6 +36,42 @@ def generate_referral_code(length: int = 8) -> str:
 
 def trial_end(days: int = 30) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
+async def _grant_initial_token_allowances(user: dict) -> None:
+    """Grant the new account's one-time welcome and 14-day trial lots idempotently."""
+    from token_actions import active_catalog
+    from token_billing import TokenWalletService
+    _, catalog = await active_catalog()
+    wallet = TokenWalletService(db)
+    uid = user["id"]
+    welcome_expiry = datetime.fromisoformat(user["token_welcome_expiry_at"])
+    trial_expiry = datetime.fromisoformat(user["token_trial_end_at"])
+    try:
+        amount = int(catalog.token_policy.welcome_tokens)
+        if user.get("is_verified") is True and amount > 0:
+            await wallet.grant_tokens(
+                uid, amount, idempotency_key=f"welcome:{uid}:token-v1",
+                reason="One-time starter token grant", source="welcome_grant",
+                expires_at=welcome_expiry,
+                metadata={"role": user["role"], "policy_version": 1}
+            )
+            await db.users.update_one({"id": uid}, {"$set": {"token_welcome_granted_at": datetime.now(timezone.utc).isoformat()}})
+    except Exception as exc:
+        logger.warning("Initial welcome token grant failed for new account: %s", type(exc).__name__)
+    try:
+        amount = int(catalog.token_policy.trial_crew_tokens if user["role"] == "crew"
+                     else catalog.token_policy.trial_contractor_tokens)
+        if amount > 0 and trial_expiry > datetime.now(timezone.utc):
+            await wallet.grant_tokens(
+                uid, amount, idempotency_key=f"trial:{uid}:token-v1",
+                reason="14-day Pro trial token allowance", source="trial_grant",
+                expires_at=trial_expiry,
+                metadata={"role": user["role"], "trial_end_at": user["token_trial_end_at"], "policy_version": 1}
+            )
+            await db.users.update_one({"id": uid}, {"$set": {"token_trial_granted_at": datetime.now(timezone.utc).isoformat()}})
+    except Exception as exc:
+        logger.warning("Initial trial token grant failed for new account: %s", type(exc).__name__)
 
 
 def oauth_signup_role(value) -> str:
@@ -93,10 +130,10 @@ async def register(data: UserCreate, request: Request, response: Response):
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    trial_days = int(os.environ.get("TRIAL_DAYS", 30))
-    if data.role == "contractor":
-        trial_days = int(os.environ.get("CONTRACTOR_TRIAL_DAYS", 14))
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    token_trial_end_at = (now_dt + timedelta(days=14)).isoformat()
+    token_welcome_expiry_at = (now_dt + timedelta(days=30)).isoformat()
 
     user_doc = {
         "id": str(uuid.uuid4()),
@@ -110,7 +147,7 @@ async def register(data: UserCreate, request: Request, response: Response):
         "agreed_to_terms": data.agreed_to_terms,
         "created_at": now,
         "trial_start_date": now,
-        "trial_end_date": trial_end(trial_days),
+        "trial_end_date": token_trial_end_at,
         "trial_type": data.role,
         "subscription_status": "trial",
         "subscription_plan": None,
@@ -136,6 +173,19 @@ async def register(data: UserCreate, request: Request, response: Response):
         "token_version": 0,
     }
 
+    if token_billing_enabled():
+        user_doc.update({
+            "billing_mode": "tokens_v1",
+            "token_plan": "trial_crew" if data.role == "crew" else "trial_contractor",
+            "billing_plan": "trial_crew" if data.role == "crew" else "trial_contractor",
+            "billing_subscription_status": "trial",
+            "token_trial_started_at": now,
+            "token_trial_end_at": token_trial_end_at,
+            "token_free_period_start": now,
+            "token_free_period_anchor": now,
+            "token_welcome_expiry_at": token_welcome_expiry_at,
+        })
+
     referral_code = (data.referral_code_used or "").strip().upper()
     if referral_code:
         referrer = await db.users.find_one({"referral_code": referral_code, "is_active": True})
@@ -151,6 +201,8 @@ async def register(data: UserCreate, request: Request, response: Response):
             })
 
     await db.users.insert_one(user_doc)
+    if token_billing_enabled():
+        await _grant_initial_token_allowances(user_doc)
     log_security_event("register", request, user=user_doc["id"], role=user_doc["role"])
     token = issue_session(response, user_doc)
     await send_welcome_email(data.name, email, data.role)
@@ -300,7 +352,10 @@ async def google_oauth_callback(request: Request, response: Response):
     picture = oauth_data.get("picture") if isinstance(oauth_data.get("picture"), str) else ""
 
     user = await db.users.find_one({"email": email}, {"_id": 0})
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    token_trial_end_at = (now_dt + timedelta(days=14)).isoformat()
+    token_welcome_expiry_at = (now_dt + timedelta(days=30)).isoformat()
 
     if not user:
         user = {
@@ -315,7 +370,7 @@ async def google_oauth_callback(request: Request, response: Response):
             "agreed_to_terms": True,
             "created_at": now,
             "trial_start_date": now,
-            "trial_end_date": trial_end(int(os.environ.get("TRIAL_DAYS", 30))),
+            "trial_end_date": token_trial_end_at,
             "subscription_status": "trial",
             "subscription_plan": None,
             "subscription_end": None,
@@ -339,7 +394,21 @@ async def google_oauth_callback(request: Request, response: Response):
             "auth_provider": "google",
             "token_version": 0,
         }
+        if token_billing_enabled():
+            user.update({
+                "billing_mode": "tokens_v1",
+                "token_plan": "trial_crew" if requested_role == "crew" else "trial_contractor",
+                "billing_plan": "trial_crew" if requested_role == "crew" else "trial_contractor",
+                "billing_subscription_status": "trial",
+                "token_trial_started_at": now,
+                "token_trial_end_at": token_trial_end_at,
+                "token_free_period_start": now,
+                "token_free_period_anchor": now,
+                "token_welcome_expiry_at": token_welcome_expiry_at,
+            })
         await db.users.insert_one(user)
+        if token_billing_enabled():
+            await _grant_initial_token_allowances(user)
         log_security_event("register", request, user=user["id"], role=requested_role, provider="google")
         await send_welcome_email(name, email, requested_role)
     else:

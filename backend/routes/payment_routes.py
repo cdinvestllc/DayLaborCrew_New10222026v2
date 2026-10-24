@@ -201,6 +201,15 @@ GUEST_JOB_PRICE = 9.99
 STAFF_ROLES = ("admin", "super_admin")
 
 
+def _guard_legacy_cash_feature(user: dict, feature: str) -> None:
+    """Don't let token-mode accounts bypass catalog pricing via old cash checkout routes."""
+    if user.get("billing_mode") == "tokens_v1":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{feature} uses tokens for this account. Use the token billing endpoint instead."
+        )
+
+
 def _parse_dt(value):
     try:
         dt = datetime.fromisoformat(value) if isinstance(value, str) else value
@@ -737,14 +746,28 @@ async def stripe_webhook(request: Request):
     event = _verify_stripe_event(
         body, request.headers.get("Stripe-Signature", ""), STRIPE_WEBHOOK_SECRET)
     event_type = event.get("type")
-    if event_type not in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+    supported = {
+        "checkout.session.completed", "checkout.session.async_payment_succeeded",
+        "invoice.paid", "invoice.payment_failed", "customer.subscription.updated",
+        "customer.subscription.deleted", "checkout.session.expired",
+    }
+    if event_type not in supported:
         return {"status": "ignored"}
-    session = event.get("data", {}).get("object") or {}
-    if session.get("object") != "checkout.session" or session.get("payment_status") != "paid":
-        return {"status": "ignored"}
+    obj = (event.get("data", {}).get("object") or {})
     try:
         _stripe_api_key()  # Enforce test/live key-mode consistency for webhook deployments too.
-        await _fulfill_stripe_checkout_session(session)
+        if event_type in {"invoice.paid", "invoice.payment_failed", "customer.subscription.updated", "customer.subscription.deleted"}:
+            from routes.token_payment_routes import handle_stripe_event
+            handled = await handle_stripe_event(event)
+            return {"status": "ok" if handled else "ignored"}
+        metadata = obj.get("metadata") or {}
+        if metadata.get("billing_system") == "token_wallet_v1":
+            from routes.token_payment_routes import handle_stripe_event
+            await handle_stripe_event(event)
+            return {"status": "ok"}
+        if obj.get("object") != "checkout.session" or obj.get("payment_status") != "paid":
+            return {"status": "ignored"}
+        await _fulfill_stripe_checkout_session(obj)
     except HTTPException:
         raise
     except Exception as exc:
@@ -764,6 +787,16 @@ async def paypal_webhook(request: Request):
     if not isinstance(event, dict):
         raise HTTPException(status_code=400, detail="Invalid PayPal webhook payload")
     await _verify_paypal_webhook(request, event)
+    try:
+        from routes.token_payment_routes import handle_paypal_event
+        if await handle_paypal_event(event):
+            return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("PayPal token billing webhook failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Payment event could not be processed; retry delivery") from None
+
     if event.get("event_type") != "PAYMENT.CAPTURE.COMPLETED":
         return {"status": "ignored"}
 
@@ -784,7 +817,7 @@ async def paypal_webhook(request: Request):
         logger.error("PayPal capture did not match its recorded provider, amount, or currency")
         return {"status": "rejected"}
     if tx.get("plan") in PLANS:
-        await fulfill_subscription_tx(order_id)
+        await fulfill_subscription_tx(order_id, expected_provider="paypal")
     elif tx.get("plan") == "boost":
         await _fulfill_boost_tx(order_id)
     else:
@@ -919,6 +952,7 @@ BOOST_DURATION_DAYS = 7
 
 @router.post("/boost/stripe/{job_id}")
 async def boost_job_stripe(job_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "job boost")
     job = await db.jobs.find_one({"id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -991,6 +1025,7 @@ async def boost_stripe_status(session_id: str, request: Request, current_user: d
 
 @router.post("/boost/paypal/{job_id}")
 async def boost_job_paypal(job_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "job boost")
     job = await db.jobs.find_one({"id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1070,6 +1105,7 @@ async def boost_paypal_capture(order_id: str, job_id: str, current_user: dict = 
 
 @router.post("/verified-contractor/create-session")
 async def create_verified_contractor_session(request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "contractor verification")
     if current_user.get("role") != "contractor":
         raise HTTPException(status_code=403, detail="Only contractors can purchase verification")
     expires = _parse_dt(current_user.get("verified_expires_at"))
@@ -1410,6 +1446,7 @@ async def fulfill_emergency_tx(session_id: str) -> dict | None:
 
 @router.post("/emergency/stripe/{job_id}")
 async def emergency_checkout(job_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    _guard_legacy_cash_feature(current_user, "emergency job posting")
     job = await db.jobs.find_one({"id": job_id}, {"_id": 0})
     if not job or job["contractor_id"] != current_user["id"]:
         raise HTTPException(status_code=404, detail="Job not found")

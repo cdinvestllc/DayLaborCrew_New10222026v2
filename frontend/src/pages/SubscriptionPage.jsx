@@ -1,336 +1,319 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { useAuth } from "../contexts/AuthContext";
-import Navbar from "../components/Navbar";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { toast } from "sonner";
-import { Check, Clock, Zap, Shield, Tag, X } from "lucide-react";
-import { PayPalButtons, PayPalScriptProvider } from "@paypal/react-paypal-js";
+import { CheckCircle, Coins, CreditCard, Loader2, RefreshCw, ShieldCheck, Wallet } from "lucide-react";
+import Navbar from "../components/Navbar";
+import { useAuth } from "../contexts/AuthContext";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const PAYPAL_CLIENT_ID = process.env.REACT_APP_PAYPAL_CLIENT_ID || "";
-// Validate: PayPal client IDs start with "A", not "re_" (Stripe key) or similar
-const PAYPAL_VALID = PAYPAL_CLIENT_ID && !PAYPAL_CLIENT_ID.startsWith("re_") && !PAYPAL_CLIENT_ID.startsWith("sk_");
+const API = `${process.env.REACT_APP_BACKEND_URL}/api/billing`;
 
-const FEATURES = {
-  crew: ["View and accept local jobs", "Real-time job alerts", "AI-powered job matching", "Portfolio showcase", "Referral rewards program"],
-  contractor: ["Post unlimited jobs", "Access to all available crew", "Real-time crew tracking on map", "Job management dashboard", "Priority support"],
-};
+function newRequestKey() {
+  if (typeof window !== "undefined" && window.crypto?.randomUUID) {
+    return `web-${window.crypto.randomUUID()}`;
+  }
+  return `web-${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function money(cents, currency = "usd") {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency", currency: (currency || "usd").toUpperCase()
+  }).format((Number(cents) || 0) / 100);
+}
 
 export default function SubscriptionPage() {
-  const { user, refreshUser } = useAuth();
-  const navigate = useNavigate();
-  const [params] = useSearchParams();
-  const [plans, setPlans] = useState({});
-  const [selectedPlan, setSelectedPlan] = useState("");
+  const { user } = useAuth();
+  const [params, setParams] = useSearchParams();
+  const [catalog, setCatalog] = useState(null);
+  const [wallet, setWallet] = useState({ balance: 0, lots: [] });
+  const [interval, setInterval] = useState("month");
+  const [provider, setProvider] = useState("stripe");
   const [loading, setLoading] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState(PAYPAL_VALID ? "paypal" : "stripe");
+  const [refreshing, setRefreshing] = useState(false);
+  const requestKeys = useRef(new Map());
   const handledReturn = useRef(null);
-  const [couponCode, setCouponCode] = useState("");
-  const [couponResult, setCouponResult] = useState(null);
-  const [validatingCoupon, setValidatingCoupon] = useState(false);
-  const [paypalOrderId, setPaypalOrderId] = useState(null);
 
-  const fetchPlans = useCallback(async () => {
+  const planId = user?.role === "contractor" ? "pro_contractor" : "pro_crew";
+  const plan = catalog?.catalog?.plans?.[planId];
+  const tokenPack = catalog?.catalog?.token_pack;
+  const providerEnabled = Boolean(catalog?.catalog?.payment_providers?.[provider]);
+
+  const refreshData = useCallback(async () => {
+    setRefreshing(true);
     try {
-      const res = await axios.get(`${API}/payments/plans`, { params: { role: user?.role } });
-      setPlans(res.data);
-      const keys = Object.keys(res.data);
-      setSelectedPlan(p => (p && res.data[p]) ? p : keys[0] || "");
-    } catch { }
-  }, [user?.role]);
+      const [catalogResponse, walletResponse] = await Promise.all([
+        axios.get(`${API}/catalog`),
+        axios.get(`${API}/wallet`)
+      ]);
+      setCatalog(catalogResponse.data);
+      setWallet(walletResponse.data);
+    } catch (error) {
+      toast.error(error?.response?.data?.detail || "Billing information is temporarily unavailable.");
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
 
-  useEffect(() => { fetchPlans(); }, [fetchPlans]);
+  useEffect(() => { refreshData(); }, [refreshData]);
 
-  const capturePayPal = useCallback(async (orderId, plan) => {
+  const pollBillingReturn = useCallback(async () => {
+    const returnType = params.get("billing_return");
+    const sessionId = params.get("session_id");
+    const subscriptionId = params.get("billing_subscription_id");
+    const paymentId = params.get("billing_payment_id");
+    const cancelRequested = params.get("billing_cancelled");
+    const returnKey = `${returnType || ""}:${sessionId || ""}:${subscriptionId || ""}:${paymentId || ""}:${cancelRequested || ""}`;
+    if (handledReturn.current === returnKey || !(returnType || cancelRequested)) return;
+    handledReturn.current = returnKey;
+
+    if (cancelRequested === "1") {
+      toast.message("Checkout was cancelled; no tokens were granted.");
+      setParams(current => {
+        const next = new URLSearchParams(current);
+        next.delete("billing_cancelled");
+        next.delete("billing_return");
+        next.delete("session_id");
+        next.delete("billing_subscription_id");
+        next.delete("billing_payment_id");
+        return next;
+      }, { replace: true });
+      return;
+    }
+
     setLoading(true);
     try {
-      const res = await axios.post(`${API}/payments/paypal/capture/${orderId}?plan=${plan}`);
-      if (res.data.status === "COMPLETED") {
-        toast.success("Payment successful! Subscription activated.");
-        await refreshUser();
-        setTimeout(() => navigate(user?.role === "contractor" ? "/contractor/dashboard" : "/crew/dashboard"), 1500);
+      if (returnType === "paypal-pack" && paymentId) {
+        const result = await axios.post(`${API}/payments/paypal/token-pack-capture-payment/${encodeURIComponent(paymentId)}`);
+        if (result.data.payment_status !== "fulfilled" && result.data.status !== "COMPLETED") {
+          throw new Error("Payment is not complete yet. The wallet has not been credited.");
+        }
+      } else if (returnType === "stripe-subscription" || returnType === "stripe-pack") {
+        if (!sessionId) throw new Error("The checkout session reference is missing.");
+        let confirmed = false;
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          const status = await axios.get(`${API}/payments/stripe/status/${encodeURIComponent(sessionId)}`);
+          if (returnType === "stripe-pack" && status.data.payment_status === "paid" && status.data.tokens_granted) {
+            confirmed = true;
+            break;
+          }
+          if (returnType === "stripe-subscription" && status.data.payment_status === "paid" && status.data.tokens_granted) {
+            confirmed = true;
+            break;
+          }
+          if (status.data.payment_status === "verification_failed") {
+            throw new Error("Payment could not be verified. No tokens were granted.");
+          }
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        if (!confirmed) throw new Error("Payment verification is still processing. Refresh your wallet shortly.");
+      } else if (returnType === "paypal-subscription" && subscriptionId) {
+        let confirmed = false;
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          const status = await axios.get(`${API}/payments/paypal/subscription-status/${encodeURIComponent(subscriptionId)}`);
+          if (status.data.tokens_granted) {
+            confirmed = true;
+            break;
+          }
+          if (["cancelled", "expired", "suspended"].includes(status.data.status)) {
+            throw new Error("The PayPal subscription is not active. No tokens were granted.");
+          }
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        if (!confirmed) throw new Error("PayPal payment is still processing. Tokens will appear after the verified payment event.");
+      } else {
+        throw new Error("The returned billing session could not be identified.");
       }
-    } catch (e) {
-      toast.error(e?.response?.data?.detail || "Payment capture failed");
+      await refreshData();
+      toast.success("Payment verified. Your token wallet has been updated.");
+    } catch (error) {
+      toast.error(error?.response?.data?.detail || error.message || "Payment is processing; no unverified tokens were added.");
+      await refreshData();
     } finally {
       setLoading(false);
+      setParams(current => {
+        const next = new URLSearchParams(current);
+        ["billing_return", "session_id", "billing_subscription_id", "billing_payment_id", "billing_cancelled"].forEach(key => next.delete(key));
+        return next;
+      }, { replace: true });
     }
-  }, [refreshUser, navigate, user?.role]);
+  }, [params, refreshData, setParams]);
 
-  const verifyStripe = useCallback(async (sessionId) => {
-    // Stripe can report "unpaid" for a few seconds after redirect - poll briefly before giving up.
-    setLoading(true);
-    for (let attempt = 0; attempt < 8; attempt++) {
-      try {
-        const res = await axios.get(`${API}/payments/stripe/status/${sessionId}`);
-        if (res.data.payment_status === "paid") {
-          toast.success("Payment confirmed! Subscription active.");
-          await refreshUser();
-          setLoading(false);
-          setTimeout(() => navigate(user?.role === "contractor" ? "/contractor/dashboard" : "/crew/dashboard"), 1500);
-          return;
-        }
-        if (res.data.status === "expired" || res.data.payment_status === "verification_failed") break;
-      } catch { /* retry */ }
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    setLoading(false);
-    toast.error("We couldn't confirm your payment yet. If you were charged, refresh this page in a minute.");
-  }, [refreshUser, navigate, user?.role]);
+  useEffect(() => { pollBillingReturn(); }, [pollBillingReturn]);
 
-  useEffect(() => {
-    const method = params.get("method");
-    const plan = params.get("plan");
-    const orderId = params.get("order_id") || params.get("token");
-    const sessionId = params.get("session_id");
-    // Handle each payment return only once (the callbacks change when the user refreshes).
-    const key = method === "paypal" ? orderId : sessionId;
-    if (!key || handledReturn.current === key) return;
-    if (method === "paypal" && plan && orderId) {
-      handledReturn.current = key;
-      capturePayPal(orderId, plan);
-    }
-    if (sessionId && method === "stripe") {
-      handledReturn.current = key;
-      verifyStripe(sessionId);
-    }
-  }, [params, capturePayPal, verifyStripe]);
-
-  const validateCoupon = async () => {
-    if (!couponCode.trim()) return;
-    setValidatingCoupon(true);
-    try {
-      const res = await axios.get(`${API}/payments/coupon/${couponCode.trim()}?plan=${selectedPlan}`);
-      setCouponResult(res.data);
-      toast.success(`Coupon applied! ${res.data.discount_percent}% off`);
-    } catch (e) {
-      setCouponResult(null);
-      toast.error(e?.response?.data?.detail || "Invalid coupon");
-    }
-    setValidatingCoupon(false);
+  const stableRequestKey = (operation) => {
+    const key = `${operation}:${provider}:${interval}`;
+    if (!requestKeys.current.has(key)) requestKeys.current.set(key, newRequestKey());
+    return requestKeys.current.get(key);
   };
 
-  const clearCoupon = () => {
-    setCouponCode("");
-    setCouponResult(null);
-  };
-
-  const getDisplayPrice = () => {
-    if (!plans[selectedPlan]) return "—";
-    if (couponResult) return `$${couponResult.final_price.toFixed(2)}`;
-    return `$${plans[selectedPlan]?.amount?.toFixed(2)}`;
-  };
-
-  const getOriginalPrice = () => plans[selectedPlan]?.amount?.toFixed(2);
-
-  const handleStripeCheckout = async () => {
+  const startSubscription = async () => {
+    if (!providerEnabled) {
+      toast.error(`${provider.replace("_", " ")} payments are not enabled yet.`);
+      return;
+    }
+    if (!plan) {
+      toast.error("The subscription catalog has not loaded.");
+      return;
+    }
     setLoading(true);
     try {
-      const res = await axios.post(`${API}/payments/stripe/create-session`, {
-        plan: selectedPlan,
-        payment_method: "stripe",
+      const endpoint = provider === "stripe"
+        ? `${API}/payments/stripe/subscription-session`
+        : `${API}/payments/paypal/subscription`;
+      const response = await axios.post(endpoint, {
+        interval,
         origin_url: window.location.origin,
-        coupon_code: couponResult ? couponCode : null
+        request_key: stableRequestKey("subscription")
       });
-      window.location.href = res.data.url;
-    } catch (e) {
-      toast.error(e?.response?.data?.detail || "Checkout failed");
+      const url = response.data.url || response.data.approve_url;
+      if (!url) throw new Error("The payment provider did not return a checkout URL.");
+      window.location.assign(url);
+    } catch (error) {
+      toast.error(error?.response?.data?.detail || error.message || "Could not start subscription checkout.");
       setLoading(false);
     }
   };
 
-  const createPayPalOrder = async () => {
-    const res = await axios.post(`${API}/payments/paypal/create-order`, {
-      plan: selectedPlan,
-      payment_method: "paypal",
-      origin_url: window.location.origin,
-      coupon_code: couponResult ? couponCode : null
-    });
-    setPaypalOrderId(res.data.order_id);
-    return res.data.order_id;
+  const buyTokenPack = async () => {
+    if (!providerEnabled || !tokenPack?.enabled) {
+      toast.error("Token pack checkout is not available with this payment method.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const endpoint = provider === "stripe"
+        ? `${API}/payments/stripe/token-pack-session`
+        : `${API}/payments/paypal/token-pack-order`;
+      const response = await axios.post(endpoint, {
+        origin_url: window.location.origin,
+        request_key: stableRequestKey("token-pack")
+      });
+      const url = response.data.url || response.data.approve_url;
+      if (!url) throw new Error("The payment provider did not return a checkout URL.");
+      window.location.assign(url);
+    } catch (error) {
+      toast.error(error?.response?.data?.detail || error.message || "Could not start token pack checkout.");
+      setLoading(false);
+    }
   };
 
-  const onPayPalApprove = async (data) => {
-    await capturePayPal(data.orderID, selectedPlan);
-  };
-
-  const features = FEATURES[user?.role] || FEATURES.crew;
+  const activeLots = (wallet.lots || []).filter(lot => Number(lot.remaining) > 0);
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[#020617]" style={{ fontFamily: "Inter, sans-serif" }}>
       <Navbar />
-      <div className="max-w-4xl mx-auto px-4 py-10">
-        {/* Trial Expiry Banner */}
-        {user?.subscription_status === "trial" && (
-          <div className="bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700 rounded-xl p-4 mb-6 flex items-center gap-3">
-            <Clock className="w-5 h-5 text-amber-500 flex-shrink-0" />
-            <div>
-              <p className="font-semibold text-amber-700 dark:text-amber-300">Your trial is active</p>
-              <p className="text-sm text-amber-600 dark:text-amber-400">
-                Expires: {user?.trial_end_date ? new Date(user.trial_end_date).toLocaleDateString() : "Soon"}. Subscribe to keep access.
-              </p>
-            </div>
-          </div>
-        )}
-
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-extrabold text-[#050A30] dark:text-white mb-2" style={{ fontFamily: "Manrope, sans-serif" }}>
-            Choose Your Plan
-          </h1>
-          <p className="text-slate-500 dark:text-slate-400">
-            {user?.role === "contractor" ? "Post jobs and hire qualified crew" : "Find jobs and grow your career"}
-          </p>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-          {Object.keys(plans).map(plan => (
-            <button key={plan} onClick={() => { setSelectedPlan(plan); clearCoupon(); }}
-              className={`card p-6 text-left transition-all border-2 ${selectedPlan === plan ? "border-[#0000FF] shadow-lg shadow-blue-100" : "border-transparent hover:border-slate-200"}`}
-              data-testid={`plan-${plan}`}>
-              <div className="flex items-center justify-between mb-1">
-                <span className="font-extrabold text-[#050A30] dark:text-white capitalize" style={{ fontFamily: "Manrope, sans-serif" }}>
-                  {plans[plan].label}
-                </span>
-                {(plan === "crew_annual" || plan === "contractor_pro") && <span className="bg-[#0000FF] text-white text-xs px-2 py-0.5 rounded-full font-bold">BEST VALUE</span>}
-              </div>
-              <div className="text-3xl font-extrabold text-[#0000FF] mb-1">
-                ${plans[plan]?.amount?.toFixed(2) || "—"}
-              </div>
-              <div className="text-sm text-slate-500">
-                {plans[plan].days === 365 ? "per year" : plans[plan].days === 90 ? "every 3 months" : "per month"}
-                {plans[plan].job_posts ? ` · ${plans[plan].job_posts} job posts` : ""}
-              </div>
-              {selectedPlan === plan && (
-                <div className="mt-3 w-5 h-5 bg-[#0000FF] rounded-full flex items-center justify-center ml-auto">
-                  <Check className="w-3 h-3 text-white" />
-                </div>
-              )}
-            </button>
-          ))}
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Features */}
-          <div className="card p-6">
-            <h3 className="font-bold text-[#050A30] dark:text-white mb-4 flex items-center gap-2">
-              <Shield className="w-5 h-5 text-[#0000FF]" /> What's Included
-            </h3>
-            <ul className="space-y-2">
-              {features.map((f, i) => (
-                <li key={i} className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
-                  <Check className="w-4 h-4 text-emerald-500 flex-shrink-0" /> {f}
-                </li>
-              ))}
-            </ul>
-          </div>
-
-          {/* Payment */}
-          <div className="card p-6">
-            <h3 className="font-bold text-[#050A30] dark:text-white mb-4">Complete Payment</h3>
-
-            {/* Coupon */}
-            <div className="mb-4">
-              <label className="block text-sm font-semibold text-[#050A30] dark:text-white mb-1.5 flex items-center gap-1.5">
-                <Tag className="w-4 h-4 text-[#0000FF]" /> Coupon Code
-              </label>
-              {couponResult ? (
-                <div className="flex items-center justify-between bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-700 rounded-lg px-3 py-2">
-                  <div>
-                    <p className="font-bold text-green-700 dark:text-green-400 text-sm">{couponCode.toUpperCase()} — {couponResult.discount_percent}% OFF</p>
-                    <p className="text-xs text-green-600 dark:text-green-500">{couponResult.uses_remaining} uses remaining</p>
-                  </div>
-                  <button onClick={clearCoupon} className="text-slate-400 hover:text-red-500" data-testid="remove-coupon-btn">
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-              ) : (
-                <div className="flex gap-2">
-                  <input type="text" value={couponCode} onChange={e => setCouponCode(e.target.value.toUpperCase())}
-                    placeholder="Enter coupon code"
-                    onKeyDown={e => e.key === "Enter" && validateCoupon()}
-                    className="flex-1 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#0000FF] dark:bg-slate-800 dark:text-white uppercase"
-                    data-testid="coupon-input" />
-                  <button onClick={validateCoupon} disabled={!couponCode || validatingCoupon}
-                    className="px-4 py-2 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 rounded-lg text-sm font-semibold hover:bg-slate-200 disabled:opacity-60"
-                    data-testid="apply-coupon-btn">
-                    {validatingCoupon ? "..." : "Apply"}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Price Summary */}
-            <div className="bg-slate-50 dark:bg-slate-800 rounded-xl p-4 mb-4">
-              <div className="flex justify-between text-sm mb-1">
-                <span className="text-slate-500">{plans[selectedPlan]?.label || selectedPlan} plan</span>
-                <span className={couponResult ? "line-through text-slate-400" : "font-bold text-[#050A30] dark:text-white"}>
-                  ${getOriginalPrice()}
-                </span>
-              </div>
-              {couponResult && (
-                <>
-                  <div className="flex justify-between text-sm mb-1">
-                    <span className="text-green-600">Coupon ({couponResult.discount_percent}% off)</span>
-                    <span className="text-green-600 font-semibold">-${(couponResult.original_price - couponResult.final_price).toFixed(2)}</span>
-                  </div>
-                  <div className="flex justify-between text-base font-extrabold text-[#050A30] dark:text-white border-t border-slate-200 dark:border-slate-700 pt-2 mt-1">
-                    <span>Total</span>
-                    <span className="text-[#0000FF]">{getDisplayPrice()}</span>
-                  </div>
-                </>
-              )}
-            </div>
-
-            {/* Payment method selector */}
-            <div className="flex gap-2 mb-4">
-              <button onClick={() => setPaymentMethod("paypal")}
-                className={`flex-1 py-2 rounded-lg font-semibold text-sm border-2 transition-colors ${paymentMethod === "paypal" ? "border-[#0000FF] bg-blue-50 dark:bg-blue-950 text-[#0000FF]" : "border-slate-200 dark:border-slate-600 text-slate-500"}`}
-                data-testid="paypal-method-btn">
-                PayPal
-              </button>
-              <button onClick={() => setPaymentMethod("stripe")}
-                className={`flex-1 py-2 rounded-lg font-semibold text-sm border-2 transition-colors ${paymentMethod === "stripe" ? "border-[#0000FF] bg-blue-50 dark:bg-blue-950 text-[#0000FF]" : "border-slate-200 dark:border-slate-600 text-slate-500"}`}
-                data-testid="stripe-method-btn">
-                Card (Stripe)
-              </button>
-            </div>
-
-            {paymentMethod === "stripe" ? (
-              <button onClick={handleStripeCheckout} disabled={loading}
-                className="w-full bg-[#0000FF] text-white py-3.5 rounded-xl font-extrabold text-base hover:bg-blue-700 transition-colors disabled:opacity-60 flex items-center justify-center gap-2"
-                data-testid="stripe-checkout-btn">
-                {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Zap className="w-5 h-5" />}
-                {loading ? "Processing..." : `Pay ${getDisplayPrice()} with Card`}
-              </button>
-            ) : PAYPAL_VALID ? (
-              <PayPalScriptProvider options={{ clientId: PAYPAL_CLIENT_ID, currency: "USD" }}>
-                <PayPalButtons
-                  style={{ layout: "vertical", shape: "rect", label: "pay" }}
-                  createOrder={createPayPalOrder}
-                  onApprove={onPayPalApprove}
-                  onError={(err) => toast.error("PayPal error: " + (err?.message || String(err)))}
-                  disabled={loading}
-                />
-              </PayPalScriptProvider>
-            ) : (
-              <div className="bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-700 rounded-xl p-4 text-center" data-testid="paypal-unavailable">
-                <p className="text-amber-700 dark:text-amber-300 font-semibold text-sm mb-1">PayPal Unavailable</p>
-                <p className="text-amber-600 dark:text-amber-400 text-xs">PayPal is not configured. Please use Card (Stripe) to complete payment.</p>
-                <button onClick={() => setPaymentMethod("stripe")}
-                  className="mt-3 text-sm font-bold text-[#0000FF] hover:underline"
-                  data-testid="switch-to-stripe-btn">
-                  Switch to Card Payment
-                </button>
-              </div>
-            )}
-
-            <p className="text-xs text-center text-slate-400 mt-3">
-              Secure payment. Cancel anytime. No hidden fees.
+      <main className="max-w-5xl mx-auto px-4 py-10">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between mb-8">
+          <div>
+            <h1 className="text-3xl sm:text-4xl font-extrabold text-[#050A30] dark:text-white mb-2"
+              style={{ fontFamily: "Manrope, sans-serif" }}>Tokens & Membership</h1>
+            <p className="text-slate-600 dark:text-slate-400">
+              Payments are verified server-side. Tokens are added only after confirmation by the payment provider.
             </p>
           </div>
+          <button onClick={refreshData} disabled={refreshing || loading}
+            className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 dark:border-slate-700 px-4 py-2 text-sm font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50">
+            {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            Refresh wallet
+          </button>
         </div>
-      </div>
+
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+          <div className="md:col-span-1 rounded-2xl bg-white dark:bg-slate-900 p-6 shadow-sm border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center gap-2 text-slate-500 dark:text-slate-400 text-sm mb-3">
+              <Wallet className="h-4 w-4" /> Available tokens
+            </div>
+            <div className="text-4xl font-extrabold text-[#0000FF] dark:text-blue-300">{wallet.balance ?? 0}</div>
+            <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">Spendable balance after expired lots are removed.</p>
+            <div className="mt-5 space-y-3">
+              {activeLots.length === 0 ? <p className="text-sm text-slate-500">No active token grants yet.</p> : activeLots.slice(0, 4).map(lot => (
+                <div key={lot.lot_id} className="flex justify-between gap-3 text-sm border-t border-slate-100 dark:border-slate-800 pt-3">
+                  <div>
+                    <p className="font-semibold text-slate-700 dark:text-slate-200 capitalize">{String(lot.source || "tokens").replaceAll("_", " ")}</p>
+                    <p className="text-xs text-slate-500">Expires {lot.expires_at ? new Date(lot.expires_at).toLocaleDateString() : "—"}</p>
+                  </div>
+                  <span className="font-bold tabular-nums">{lot.remaining}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="md:col-span-2 rounded-2xl bg-white dark:bg-slate-900 p-6 shadow-sm border border-slate-200 dark:border-slate-800">
+            <div className="flex items-center gap-2 mb-4">
+              <ShieldCheck className="h-5 w-5 text-[#0000FF] dark:text-blue-300" />
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white">Pro membership</h2>
+            </div>
+            {plan ? <>
+              <p className="text-sm text-slate-500 dark:text-slate-400 mb-2">{user?.role === "contractor" ? "Pro Contractor" : "Pro Crew"}</p>
+              <div className="flex flex-wrap items-baseline gap-2 mb-4">
+                <span className="text-4xl font-extrabold text-[#0000FF] dark:text-blue-300">
+                  {money(interval === "year" ? plan.annual_price_cents : plan.monthly_price_cents, catalog?.catalog?.currency)}
+                </span>
+                <span className="text-slate-500 dark:text-slate-400">/{interval === "year" ? "year" : "month"}</span>
+              </div>
+              <p className="font-semibold text-slate-800 dark:text-slate-100 mb-3">
+                {plan.monthly_tokens} tokens every month
+              </p>
+              <div className="flex gap-2 mb-5" role="group" aria-label="Billing interval">
+                <button onClick={() => setInterval("month")}
+                  className={`rounded-lg px-4 py-2 border text-sm font-semibold ${interval === "month" ? "bg-blue-700 border-blue-700 text-white" : "border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200"}`}>
+                  Monthly
+                </button>
+                <button onClick={() => setInterval("year")}
+                  className={`rounded-lg px-4 py-2 border text-sm font-semibold ${interval === "year" ? "bg-blue-700 border-blue-700 text-white" : "border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200"}`}>
+                  Annual
+                </button>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 mb-4">
+                <label htmlFor="billing-provider" className="text-sm font-semibold text-slate-700 dark:text-slate-200">Payment method</label>
+                <select id="billing-provider" value={provider} onChange={event => setProvider(event.target.value)}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-800 dark:text-slate-100">
+                  <option value="stripe" disabled={!catalog?.catalog?.payment_providers?.stripe}>Card / Stripe</option>
+                  <option value="paypal" disabled={!catalog?.catalog?.payment_providers?.paypal}>PayPal</option>
+                </select>
+              </div>
+              <button onClick={startSubscription} disabled={loading || refreshing || !catalog || !providerEnabled}
+                className="inline-flex w-full sm:w-auto justify-center items-center gap-2 rounded-xl bg-blue-700 hover:bg-blue-800 text-white font-bold px-5 py-3 disabled:opacity-50">
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
+                Continue to secure checkout
+              </button>
+              <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+                Annual subscribers pay upfront; included monthly tokens are released on a monthly schedule. Prices are snapshots taken when checkout starts.
+              </p>
+            </> : <p className="text-sm text-slate-500">Loading the current billing catalog…</p>}
+          </div>
+        </section>
+
+        <section className="rounded-2xl bg-white dark:bg-slate-900 p-6 shadow-sm border border-slate-200 dark:border-slate-800 mb-8">
+          <div className="flex items-center gap-2 mb-2">
+            <Coins className="h-5 w-5 text-[#0000FF] dark:text-blue-300" />
+            <h2 className="text-xl font-bold text-slate-900 dark:text-white">Token pack</h2>
+          </div>
+          <p className="text-slate-600 dark:text-slate-400 mb-4">
+            Buy a one-time token pack. The wallet ledger records the purchase and its expiration date.
+          </p>
+          {tokenPack ? <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div>
+              <p className="text-2xl font-extrabold text-slate-900 dark:text-white">{tokenPack.tokens} tokens</p>
+              <p className="text-lg font-semibold text-[#0000FF] dark:text-blue-300">
+                {money(tokenPack.price_cents, catalog?.catalog?.currency)}
+              </p>
+            </div>
+            <button onClick={buyTokenPack} disabled={loading || refreshing || !tokenPack.enabled || !providerEnabled}
+              className="inline-flex justify-center items-center gap-2 rounded-xl border-2 border-blue-700 text-blue-700 dark:text-blue-300 dark:border-blue-400 hover:bg-blue-50 dark:hover:bg-slate-800 font-bold px-5 py-3 disabled:opacity-50">
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
+              Buy token pack
+            </button>
+          </div> : <p className="text-sm text-slate-500">Loading token pack price…</p>}
+        </section>
+
+        <section className="rounded-2xl border border-slate-200 dark:border-slate-800 p-5 text-sm text-slate-600 dark:text-slate-400">
+          <div className="flex items-start gap-2">
+            <CheckCircle className="h-5 w-5 shrink-0 text-emerald-600" />
+            <p>Payment confirmation and token granting are separate steps. Unpaid, mismatched, or unverified provider events do not credit the wallet. Points are separate from tokens. Expiry dates are visible in your wallet above.</p>
+          </div>
+        </section>
+      </main>
     </div>
   );
 }

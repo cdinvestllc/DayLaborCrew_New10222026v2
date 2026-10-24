@@ -38,7 +38,22 @@ jobs:
       JWT_EXPIRE_HOURS: "24"
       CORS_ORIGINS: ${{ vars.STAGING_WEB_ORIGIN }}
       TRUSTED_PROXY_HOPS: "1"
+      TOKEN_BILLING_ENABLED: "true"
+      EMERGENT_LLM_KEY: staging-only-placeholder-not-used-by-tests
       STAGING_STRIPE_MODE: ${{ vars.STAGING_STRIPE_MODE }}
+      STAGING_STRIPE_API_KEY: ${{ secrets.STAGING_STRIPE_API_KEY }}
+      STAGING_STRIPE_WEBHOOK_SECRET: ${{ secrets.STAGING_STRIPE_WEBHOOK_SECRET }}
+      STAGING_STRIPE_WEBHOOK_ENDPOINT_ID: ${{ secrets.STAGING_STRIPE_WEBHOOK_ENDPOINT_ID }}
+      STAGING_PAYPAL_CLIENT_ID: ${{ secrets.STAGING_PAYPAL_CLIENT_ID }}
+      STAGING_PAYPAL_SECRET: ${{ secrets.STAGING_PAYPAL_SECRET }}
+      STAGING_PAYPAL_WEBHOOK_ID: ${{ secrets.STAGING_PAYPAL_WEBHOOK_ID }}
+      STRIPE_API_KEY: ${{ secrets.STAGING_STRIPE_API_KEY }}
+      STRIPE_MODE: test
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STAGING_STRIPE_WEBHOOK_SECRET }}
+      PAYPAL_MODE: sandbox
+      PAYPAL_CLIENT_ID: ${{ secrets.STAGING_PAYPAL_CLIENT_ID }}
+      PAYPAL_SECRET: ${{ secrets.STAGING_PAYPAL_SECRET }}
+      PAYPAL_WEBHOOK_ID: ${{ secrets.STAGING_PAYPAL_WEBHOOK_ID }}
       STAGING_SUPERADMIN_EMAIL: ${{ vars.STAGING_SUPERADMIN_EMAIL }}
       STAGING_SUPERADMIN_PASSWORD: ${{ secrets.STAGING_SUPERADMIN_PASSWORD }}
       STAGING_ADMIN_EMAIL: ${{ vars.STAGING_ADMIN_EMAIL }}
@@ -75,6 +90,10 @@ jobs:
           python -m pip install --upgrade pip
           grep -v '^emergentintegrations==' requirements.txt > "$RUNNER_TEMP/requirements-ci.txt"
           pip install -r "$RUNNER_TEMP/requirements-ci.txt"
+      - name: Verify token billing transaction support and payment sandbox configuration
+        run: python scripts/validate_staging_token_billing.py
+      - name: Run token billing integration suite against staging
+        run: pytest -q tests/test_token_billing_staging.py
       - name: Run legacy integration suite against staging
         run: |
           pytest -q \
